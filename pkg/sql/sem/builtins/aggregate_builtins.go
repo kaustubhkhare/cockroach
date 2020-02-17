@@ -159,6 +159,39 @@ var aggregates = map[string]builtinDefinition{
 		// supports parametric types.
 	),
 
+	"covar_pop": makeBuiltin(aggProps(),
+		makeAggOverload([]*types.T{types.Float, types.Float}, types.Float, newCovarPopAggregate,
+			"Calculates the correlation coefficient of the selected values."),
+		makeAggOverload([]*types.T{types.Int, types.Int}, types.Float, newCovarPopAggregate,
+			"Calculates the correlation coefficient of the selected values."),
+		makeAggOverload([]*types.T{types.Float, types.Int}, types.Float, newCovarPopAggregate,
+			"Calculates the correlation coefficient of the selected values."),
+		makeAggOverload([]*types.T{types.Int, types.Float}, types.Float, newCovarPopAggregate,
+			"Calculates the correlation coefficient of the selected values."),
+	),
+
+	"covar_samp": makeBuiltin(aggProps(),
+		makeAggOverload([]*types.T{types.Float, types.Float}, types.Float, newCovarSampAggregate,
+			"Calculates the correlation coefficient of the selected values."),
+		makeAggOverload([]*types.T{types.Int, types.Int}, types.Float, newCovarSampAggregate,
+			"Calculates the correlation coefficient of the selected values."),
+		makeAggOverload([]*types.T{types.Float, types.Int}, types.Float, newCovarSampAggregate,
+			"Calculates the correlation coefficient of the selected values."),
+		makeAggOverload([]*types.T{types.Int, types.Float}, types.Float, newCovarSampAggregate,
+			"Calculates the correlation coefficient of the selected values."),
+	),
+
+	"regr_avgx": makeBuiltin(aggProps(),
+		makeAggOverload([]*types.T{types.Float, types.Float}, types.Float, newRegrAvgXAggregate,
+			"Calculates the correlation coefficient of the selected values."),
+		makeAggOverload([]*types.T{types.Int, types.Int}, types.Float, newRegrAvgXAggregate,
+			"Calculates the correlation coefficient of the selected values."),
+		makeAggOverload([]*types.T{types.Float, types.Int}, types.Float, newRegrAvgXAggregate,
+			"Calculates the correlation coefficient of the selected values."),
+		makeAggOverload([]*types.T{types.Int, types.Float}, types.Float, newRegrAvgXAggregate,
+			"Calculates the correlation coefficient of the selected values."),
+	),
+
 	"count": makeBuiltin(aggPropsNullableArgs(),
 		makeAggOverload([]*types.T{types.Any}, types.Int, newCountAggregate,
 			"Calculates the number of selected elements."),
@@ -394,6 +427,9 @@ func makeAggOverloadWithReturnType(
 }
 
 var _ tree.AggregateFunc = &arrayAggregate{}
+var _ tree.AggregateFunc = &covarPopAggregate{}
+var _ tree.AggregateFunc = &covarSampAggregate{}
+var _ tree.AggregateFunc = &regrAvgXAggregate{}
 var _ tree.AggregateFunc = &avgAggregate{}
 var _ tree.AggregateFunc = &countAggregate{}
 var _ tree.AggregateFunc = &countRowsAggregate{}
@@ -424,6 +460,9 @@ var _ tree.AggregateFunc = &bitAndAggregate{}
 var _ tree.AggregateFunc = &bitOrAggregate{}
 
 const sizeOfArrayAggregate = int64(unsafe.Sizeof(arrayAggregate{}))
+const sizeOfCovarPopAggregate = int64(unsafe.Sizeof(covarPopAggregate{}))
+const sizeOfRegrAvgXAggregate = int64(unsafe.Sizeof(regrAvgXAggregate{}))
+const sizeOfCovarSampAggregate = int64(unsafe.Sizeof(covarSampAggregate{}))
 const sizeOfAvgAggregate = int64(unsafe.Sizeof(avgAggregate{}))
 const sizeOfCountAggregate = int64(unsafe.Sizeof(countAggregate{}))
 const sizeOfCountRowsAggregate = int64(unsafe.Sizeof(countRowsAggregate{}))
@@ -913,6 +952,236 @@ func (a *boolOrAggregate) Close(context.Context) {}
 // Size is part of the tree.AggregateFunc interface.
 func (a *boolOrAggregate) Size() int64 {
 	return sizeOfBoolOrAggregate
+}
+
+type regrAvgXAggregate struct {
+	n  int
+	sx float64
+}
+
+func newRegrAvgXAggregate([]*types.T, *tree.EvalContext, tree.Datums) tree.AggregateFunc {
+	return &regrAvgXAggregate{}
+}
+
+func (a *regrAvgXAggregate) Add(_ context.Context, datumY tree.Datum, otherArgs ...tree.Datum) error {
+	if datumY == tree.DNull {
+		return nil
+	}
+
+	datumX := otherArgs[0]
+	if datumX == tree.DNull {
+		return nil
+	}
+
+	x, err := a.float64Val(datumX)
+	if err != nil {
+		return err
+	}
+
+	_, err = a.float64Val(datumY)
+	if err != nil {
+		return err
+	}
+
+	a.n++
+	a.sx += x
+
+	if math.IsInf(a.sx, 0) {
+		return tree.ErrFloatOutOfRange
+	}
+
+	return nil
+}
+
+func (a *regrAvgXAggregate) Result() (tree.Datum, error) {
+	if a.n < 1 {
+		return tree.DNull, nil
+	}
+
+	floatN := float64(a.n)
+
+	return tree.NewDFloat(tree.DFloat(a.sx / floatN)), nil
+}
+
+func (a *regrAvgXAggregate) Reset(context.Context) {
+	a.n = 0
+	a.sx = 0
+}
+
+func (a *regrAvgXAggregate) Close(context.Context) {}
+
+// Size implements tree.AggregateFunc interface.
+func (a *regrAvgXAggregate) Size() int64 {
+	return sizeOfRegrAvgXAggregate
+}
+
+func (a *regrAvgXAggregate) float64Val(datum tree.Datum) (float64, error) {
+	switch val := datum.(type) {
+	case *tree.DFloat:
+		return float64(*val), nil
+	case *tree.DInt:
+		return float64(*val), nil
+	default:
+		return 0, fmt.Errorf("invalid type %v", val)
+	}
+}
+
+type covarSampAggregate struct {
+	agg tree.AggregateFunc
+	n   int
+}
+
+func newCovarSampAggregate(params []*types.T, evalCtx *tree.EvalContext, datums tree.Datums) tree.AggregateFunc {
+	return &covarSampAggregate{agg: newCovarPopAggregate(params, evalCtx, datums)}
+}
+
+func (a *covarSampAggregate) Add(context context.Context, datumY tree.Datum, otherArgs ...tree.Datum) error {
+	a.n++
+	return a.agg.Add(context, datumY, otherArgs[0])
+}
+
+func (a *covarSampAggregate) Result() (tree.Datum, error) {
+
+	covarPop, err := a.agg.Result()
+	if err != nil {
+		return nil, err
+	}
+
+	floatN := float64(a.n)
+
+	// return tree.NewDFloat(tree.DFloat(float64(*sqrDiff.(*tree.DFloat)) / (float64(a.agg.Count()) - 1))), nil
+
+	return tree.NewDFloat(tree.DFloat(float64(*covarPop.(*tree.DFloat)) * float64(floatN) / float64(floatN-1))), nil
+}
+
+func (a *covarSampAggregate) Reset(ctx context.Context) {
+	a.n = 0
+	a.agg.Reset(ctx)
+}
+
+// Close implements tree.AggregateFunc interface.
+func (a *covarSampAggregate) Close(context.Context) {}
+
+// Size implements tree.AggregateFunc interface.
+func (a *covarSampAggregate) Size() int64 {
+	return sizeOfCovarSampAggregate
+}
+
+func (a *covarSampAggregate) float64Val(datum tree.Datum) (float64, error) {
+	switch val := datum.(type) {
+	case *tree.DFloat:
+		return float64(*val), nil
+	case *tree.DInt:
+		return float64(*val), nil
+	default:
+		return 0, fmt.Errorf("invalid type %v", val)
+	}
+}
+
+type covarPopAggregate struct {
+	n   int
+	sxy float64
+	sx  float64
+	sy  float64
+}
+
+func newCovarPopAggregate([]*types.T, *tree.EvalContext, tree.Datums) tree.AggregateFunc {
+	return &covarPopAggregate{}
+}
+
+func (a *covarPopAggregate) Add(_ context.Context, datumY tree.Datum, otherArgs ...tree.Datum) error {
+	if datumY == tree.DNull {
+		return nil
+	}
+
+	datumX := otherArgs[0]
+	if datumX == tree.DNull {
+		return nil
+	}
+
+	x, err := a.float64Val(datumX)
+	if err != nil {
+		return err
+	}
+
+	y, err := a.float64Val(datumY)
+	if err != nil {
+		return err
+	}
+
+	a.n++
+	a.sx += x
+	a.sy += y
+	a.sxy += x * y
+
+	if math.IsInf(a.sx, 0) ||
+		math.IsInf(a.sy, 0) ||
+		math.IsInf(a.sxy, 0) {
+		return tree.ErrFloatOutOfRange
+	}
+
+	return nil
+}
+
+func (a *covarPopAggregate) Result() (tree.Datum, error) {
+	if a.n < 1 {
+		return tree.DNull, nil
+	}
+
+	// if a.sx == 0 || a.sy == 0 || a.sxy == 0 {
+	// 	return tree.DNull, nil
+	// }
+
+	floatN := float64(a.n)
+
+	mx := a.sx / floatN
+	my := a.sy / floatN
+
+	numeratorMxMy := mx * my
+	if math.IsInf(numeratorMxMy, 0) {
+		return tree.DNull, pgerror.New(pgcode.NumericValueOutOfRange, "float out of range")
+	}
+
+	numeratorSxMy := a.sx * my
+	if math.IsInf(numeratorSxMy, 0) {
+		return tree.DNull, pgerror.New(pgcode.NumericValueOutOfRange, "float out of range")
+	}
+
+	numeratorSyMx := a.sy * mx
+	if math.IsInf(numeratorSyMx, 0) {
+		return tree.DNull, pgerror.New(pgcode.NumericValueOutOfRange, "float out of range")
+	}
+
+	numerator := a.sxy - numeratorSxMy - numeratorSyMx + numeratorMxMy*floatN
+
+	return tree.NewDFloat(tree.DFloat(numerator / floatN)), nil
+}
+
+// Reset implements tree.AggregateFunc interface.
+func (a *covarPopAggregate) Reset(context.Context) {
+	a.n = 0
+	a.sx = 0
+	a.sy = 0
+	a.sxy = 0
+}
+
+// Close implements tree.AggregateFunc interface.
+func (a *covarPopAggregate) Close(context.Context) {}
+
+// Size implements tree.AggregateFunc interface.
+func (a *covarPopAggregate) Size() int64 {
+	return sizeOfCovarPopAggregate
+}
+
+func (a *covarPopAggregate) float64Val(datum tree.Datum) (float64, error) {
+	switch val := datum.(type) {
+	case *tree.DFloat:
+		return float64(*val), nil
+	case *tree.DInt:
+		return float64(*val), nil
+	default:
+		return 0, fmt.Errorf("invalid type %v", val)
+	}
 }
 
 type countAggregate struct {

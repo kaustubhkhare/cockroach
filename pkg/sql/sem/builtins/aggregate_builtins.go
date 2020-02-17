@@ -1123,6 +1123,7 @@ func (a *covarPopAggregate) Add(_ context.Context, datumY tree.Datum, otherArgs 
 	return nil
 }
 
+// Using SUM((xi-xm)(yi -ym))/n = [SUM(xi * yi) - ym * SUM(xi) - xm * SUM(yi) + xmym] / n
 func (a *covarPopAggregate) Result() (tree.Datum, error) {
 	if a.n < 1 {
 		return tree.DNull, nil

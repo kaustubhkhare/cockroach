@@ -382,6 +382,12 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 				prefix = ", "
 			})
 			v.observer.attr(name, "distinct on", buf.String())
+			if n.nullsAreDistinct {
+				v.observer.attr(name, "nulls are distinct", "")
+			}
+			if n.errorOnDup != "" {
+				v.observer.attr(name, "error on dups", "")
+			}
 		}
 
 		if !n.columnsInOrder.Empty() {
@@ -417,11 +423,17 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 					buf.WriteString(inputCols[groupingCol].Name)
 				} else {
 					fmt.Fprintf(&buf, "%s(", agg.funcName)
-					if agg.argRenderIdx != noRenderIdx {
+					if len(agg.argRenderIdxs) > 0 {
 						if agg.isDistinct() {
 							buf.WriteString("DISTINCT ")
 						}
-						buf.WriteString(inputCols[agg.argRenderIdx].Name)
+
+						for i, idx := range agg.argRenderIdxs {
+							if i != 0 {
+								buf.WriteString(", ")
+							}
+							buf.WriteString(inputCols[idx].Name)
+						}
 					}
 					buf.WriteByte(')')
 					if agg.filterRenderIdx != noRenderIdx {
@@ -827,6 +839,7 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&alterSequenceNode{}):        "alter sequence",
 	reflect.TypeOf(&alterTableNode{}):           "alter table",
 	reflect.TypeOf(&alterUserSetPasswordNode{}): "alter user",
+	reflect.TypeOf(&alterRoleNode{}):            "alter role",
 	reflect.TypeOf(&applyJoinNode{}):            "apply-join",
 	reflect.TypeOf(&bufferNode{}):               "buffer node",
 	reflect.TypeOf(&cancelQueriesNode{}):        "cancel queries",

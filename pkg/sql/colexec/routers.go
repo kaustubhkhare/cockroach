@@ -23,6 +23,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
+	"github.com/marusama/semaphore"
 )
 
 // routerOutput is an interface implemented by router outputs. It exists for
@@ -32,7 +34,7 @@ type routerOutput interface {
 	// addBatch adds the elements specified by the selection vector from batch to
 	// the output. It returns whether or not the output changed its state to
 	// blocked (see implementations).
-	addBatch(coldata.Batch, []uint16) bool
+	addBatch(context.Context, coldata.Batch, []uint16) bool
 	// cancel tells the output to stop producing batches.
 	cancel(ctx context.Context)
 }
@@ -58,6 +60,35 @@ type routerOutputOp struct {
 
 	mu struct {
 		syncutil.Mutex
+		// unlimitedAllocator tracks the memory usage of this router output,
+		// providing a signal for when it should spill to disk.
+		// The memory lifecycle is as follows:
+		//
+		// o.mu.pendingBatch is allocated as a "staging" area. Tuples are copied
+		// into it in addBatch.
+		// A read may come in in this state, in which case pendingBatch is returned
+		// and references to it are removed. Since batches are unsafe for reuse,
+		// the batch is also manually released from the allocator.
+		// If a read does not come in and the batch becomes full of tuples, that
+		// batch is stored in o.mu.data, which is a queue with an in-memory circular
+		// buffer backed by disk. If the batch fits in memory, a reference to it
+		// is retained and a new pendingBatch is allocated.
+		//
+		// If a read comes in at this point, the batch is dequeued from o.mu.data
+		// and returned, but the memory is still accounted for. In fact, memory use
+		// increases up to when o.mu.data is full and must spill to disk.
+		// Once it spills to disk, the spillingQueue (o.mu.data), will release
+		// batches it spills to disk to stop accounting for them.
+		// The tricky part comes when o.mu.data is dequeued from. In this case, the
+		// reference for a previously-returned batch is overwritten with an on-disk
+		// batch, so the memory for the overwritten batch is released, while the
+		// new batch's memory is retained. Note that if batches are being dequeued
+		// from disk, it must be the case that the circular buffer is now empty,
+		// holding references to batches that have been previously returned.
+		//
+		// In short, batches whose references are retained are also retained in the
+		// allocator, but if any references are overwritten or lost, those batches
+		// are released.
 		unlimitedAllocator *Allocator
 		cond               *sync.Cond
 		done               bool
@@ -112,10 +143,9 @@ func newRouterOutputOp(
 	unblockedEventsChan chan<- struct{},
 	memoryLimit int64,
 	cfg colcontainer.DiskQueueCfg,
+	fdSemaphore semaphore.Semaphore,
 ) *routerOutputOp {
-	return newRouterOutputOpWithBlockedThresholdAndBatchSize(
-		unlimitedAllocator, types, unblockedEventsChan, memoryLimit, cfg, getDefaultRouterOutputBlockedThreshold(), int(coldata.BatchSize()),
-	)
+	return newRouterOutputOpWithBlockedThresholdAndBatchSize(unlimitedAllocator, types, unblockedEventsChan, memoryLimit, cfg, fdSemaphore, getDefaultRouterOutputBlockedThreshold(), int(coldata.BatchSize()))
 }
 
 func newRouterOutputOpWithBlockedThresholdAndBatchSize(
@@ -124,6 +154,7 @@ func newRouterOutputOpWithBlockedThresholdAndBatchSize(
 	unblockedEventsChan chan<- struct{},
 	memoryLimit int64,
 	cfg colcontainer.DiskQueueCfg,
+	fdSemaphore semaphore.Semaphore,
 	blockedThreshold int,
 	outputBatchSize int,
 ) *routerOutputOp {
@@ -135,7 +166,7 @@ func newRouterOutputOpWithBlockedThresholdAndBatchSize(
 	}
 	o.mu.unlimitedAllocator = unlimitedAllocator
 	o.mu.cond = sync.NewCond(&o.mu)
-	o.mu.data = newSpillingQueue(unlimitedAllocator, types, memoryLimit, cfg, outputBatchSize)
+	o.mu.data = newSpillingQueue(unlimitedAllocator, types, memoryLimit, cfg, fdSemaphore, outputBatchSize)
 
 	return o
 }
@@ -145,7 +176,7 @@ func (o *routerOutputOp) Init() {}
 // Next returns the next coldata.Batch from the routerOutputOp. Note that Next
 // is designed for only one concurrent caller and will block until data is
 // ready.
-func (o *routerOutputOp) Next(context.Context) coldata.Batch {
+func (o *routerOutputOp) Next(ctx context.Context) coldata.Batch {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.mu.done {
@@ -164,6 +195,7 @@ func (o *routerOutputOp) Next(context.Context) coldata.Batch {
 		// but there is a o.mu.pendingBatch that has not been flushed yet. Return
 		// this batch directly.
 		b = o.mu.pendingBatch
+		o.mu.unlimitedAllocator.ReleaseBatch(b)
 		o.mu.pendingBatch = nil
 	} else {
 		var err error
@@ -177,18 +209,15 @@ func (o *routerOutputOp) Next(context.Context) coldata.Batch {
 		o.maybeUnblockLocked()
 	}
 	if b.Length() == 0 {
-		// This is the last batch. Set done to protect against further calls to
-		// Next since this is allowed by the interface.
-		o.mu.done = true
+		// This is the last batch. closeLocked will set done to protect against
+		// further calls to Next since this is allowed by the interface as well as
+		// cleaning up and releasing possible disk infrastructure.
+		o.closeLocked(ctx)
 	}
 	return b
 }
 
-// cancel wakes up a reader in Next if there is one and results in the output
-// returning zero length batches for every Next call after cancel. Note that
-// all accumulated data that hasn't been read will not be returned.
-func (o *routerOutputOp) cancel(ctx context.Context) {
-	o.mu.Lock()
+func (o *routerOutputOp) closeLocked(ctx context.Context) {
 	o.mu.done = true
 	if err := o.mu.data.close(); err != nil {
 		// This log message is Info instead of Warning because the flow will also
@@ -196,6 +225,14 @@ func (o *routerOutputOp) cancel(ctx context.Context) {
 		// any effect.
 		log.Infof(ctx, "error closing vectorized hash router output, files may be left over: %s", err)
 	}
+}
+
+// cancel wakes up a reader in Next if there is one and results in the output
+// returning zero length batches for every Next call after cancel. Note that
+// all accumulated data that hasn't been read will not be returned.
+func (o *routerOutputOp) cancel(ctx context.Context) {
+	o.mu.Lock()
+	o.closeLocked(ctx)
 	// Some goroutine might be waiting on the condition variable, so wake it up.
 	// Note that read goroutines check o.mu.done, so won't wait on the condition
 	// variable after we unlock the mutex.
@@ -216,7 +253,9 @@ func (o *routerOutputOp) cancel(ctx context.Context) {
 //  disk as the code is written, meaning that we impact the performance of
 //  writing rows to a fast output if we have to write to disk for a single
 //  slow output.
-func (o *routerOutputOp) addBatch(batch coldata.Batch, selection []uint16) bool {
+func (o *routerOutputOp) addBatch(
+	ctx context.Context, batch coldata.Batch, selection []uint16,
+) bool {
 	if len(selection) > int(batch.Length()) {
 		selection = selection[:batch.Length()]
 	}
@@ -224,7 +263,7 @@ func (o *routerOutputOp) addBatch(batch coldata.Batch, selection []uint16) bool 
 	defer o.mu.Unlock()
 	if batch.Length() == 0 {
 		if o.mu.pendingBatch != nil {
-			if err := o.mu.data.enqueue(o.mu.pendingBatch); err != nil {
+			if err := o.mu.data.enqueue(ctx, o.mu.pendingBatch); err != nil {
 				execerror.VectorizedInternalPanic(err)
 			}
 		}
@@ -270,7 +309,7 @@ func (o *routerOutputOp) addBatch(batch coldata.Batch, selection []uint16) bool 
 		o.mu.pendingBatch.SetLength(newLength)
 		if o.testingKnobs.alwaysFlush || int(newLength) >= o.outputBatchSize {
 			// The capacity in o.mu.pendingBatch has been filled.
-			if err := o.mu.data.enqueue(o.mu.pendingBatch); err != nil {
+			if err := o.mu.data.enqueue(ctx, o.mu.pendingBatch); err != nil {
 				execerror.VectorizedInternalPanic(err)
 			}
 			o.mu.pendingBatch = nil
@@ -353,8 +392,12 @@ func NewHashRouter(
 	types []coltypes.T,
 	hashCols []uint32,
 	memoryLimit int64,
-	cfg colcontainer.DiskQueueCfg,
+	diskQueueCfg colcontainer.DiskQueueCfg,
+	fdSemaphore semaphore.Semaphore,
 ) (*HashRouter, []Operator) {
+	if diskQueueCfg.CacheMode != colcontainer.DiskQueueCacheModeDefault {
+		execerror.VectorizedInternalPanic(errors.Errorf("hash router instantiated with incompatible disk queue cache mode: %d", diskQueueCfg.CacheMode))
+	}
 	outputs := make([]routerOutput, len(unlimitedAllocators))
 	outputsAsOps := make([]Operator, len(unlimitedAllocators))
 	// unblockEventsChan is buffered to 2*numOutputs as we don't want the outputs
@@ -367,7 +410,7 @@ func NewHashRouter(
 	unblockEventsChan := make(chan struct{}, 2*len(unlimitedAllocators))
 	memoryLimitPerOutput := memoryLimit / int64(len(unlimitedAllocators))
 	for i := range unlimitedAllocators {
-		op := newRouterOutputOp(unlimitedAllocators[i], types, unblockEventsChan, memoryLimitPerOutput, cfg)
+		op := newRouterOutputOp(unlimitedAllocators[i], types, unblockEventsChan, memoryLimitPerOutput, diskQueueCfg, fdSemaphore)
 		outputs[i] = op
 		outputsAsOps[i] = op
 	}
@@ -469,14 +512,14 @@ func (r *HashRouter) processNextBatch(ctx context.Context) bool {
 		// Done. Push an empty batch to outputs to tell them the data is done as
 		// well.
 		for _, o := range r.outputs {
-			o.addBatch(b, nil)
+			o.addBatch(ctx, b, nil)
 		}
 		return true
 	}
 
 	selections := r.tupleDistributor.distribute(ctx, b, r.types, r.hashCols)
 	for i, o := range r.outputs {
-		if o.addBatch(b, selections[i]) {
+		if o.addBatch(ctx, b, selections[i]) {
 			// This batch blocked the output.
 			r.numBlockedOutputs++
 		}

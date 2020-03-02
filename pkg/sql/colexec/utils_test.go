@@ -13,6 +13,7 @@ package colexec
 import (
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"reflect"
@@ -27,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/pkg/errors"
@@ -55,18 +57,101 @@ func (t tuple) String() string {
 	return sb.String()
 }
 
+func (t tuple) less(other tuple) bool {
+	for i := range t {
+		// If either side is nil, we short circuit the comparison. For nil, we
+		// define: nil < {any_none_nil}
+		if t[i] == nil && other[i] == nil {
+			continue
+		} else if t[i] == nil && other[i] != nil {
+			return true
+		} else if t[i] != nil && other[i] == nil {
+			return false
+		}
+
+		lhsVal := reflect.ValueOf(t[i])
+		rhsVal := reflect.ValueOf(other[i])
+
+		// apd.Decimal are not comparable, so we check that first.
+		if lhsVal.Type().Name() == "Decimal" && lhsVal.CanInterface() {
+			lhsDecimal := lhsVal.Interface().(apd.Decimal)
+			rhsDecimal := rhsVal.Interface().(apd.Decimal)
+			cmp := (&lhsDecimal).CmpTotal(&rhsDecimal)
+			if cmp == 0 {
+				continue
+			} else if cmp == -1 {
+				return true
+			} else {
+				return false
+			}
+		}
+
+		// coltypes.Bytes is represented as []uint8.
+		if lhsVal.Type().String() == "[]uint8" {
+			lhsStr := string(lhsVal.Interface().([]uint8))
+			rhsStr := string(rhsVal.Interface().([]uint8))
+			if lhsStr == rhsStr {
+				continue
+			} else if lhsStr < rhsStr {
+				return true
+			} else {
+				return false
+			}
+		}
+
+		// No need to compare these two elements when they are the same.
+		if t[i] == other[i] {
+			continue
+		}
+
+		switch typ := lhsVal.Type().Name(); typ {
+		case "int", "int16", "int32", "int64":
+			return lhsVal.Int() < rhsVal.Int()
+		case "uint", "uint16", "uint32", "uint64":
+			return lhsVal.Uint() < rhsVal.Uint()
+		case "float", "float64":
+			return lhsVal.Float() < rhsVal.Float()
+		case "bool":
+			return lhsVal.Bool() == false && rhsVal.Bool() == true
+		case "string":
+			return lhsVal.String() < rhsVal.String()
+		default:
+			execerror.VectorizedInternalPanic(fmt.Sprintf("Unhandled comparison type: %s", typ))
+		}
+	}
+	return false
+}
+
 // tuples represents a table with any-type columns.
 type tuples []tuple
 
-type verifier func(output *opTestOutput) error
+// sort returns a copy of sorted tuples.
+func (t tuples) sort() tuples {
+	b := make(tuples, len(t))
+	for i := range b {
+		b[i] = make(tuple, len(t[i]))
+		copy(b[i], t[i])
+	}
+	sort.SliceStable(b, func(i, j int) bool {
+		lhs := b[i]
+		rhs := b[j]
+		return lhs.less(rhs)
+	})
+	return b
+}
 
-// orderedVerifier compares the input and output tuples, returning an error if
-// they're not identical.
-var orderedVerifier verifier = (*opTestOutput).Verify
+type verifierType int
 
-// unorderedVerifier compares the input and output tuples as sets, returning an
-// error if they aren't equal by set comparison (irrespective of order).
-var unorderedVerifier verifier = (*opTestOutput).VerifyAnyOrder
+const (
+	// orderedVerifier compares the input and output tuples, returning an error
+	// if they're not identical.
+	orderedVerifier verifierType = iota
+	// unorderedVerifier compares the input and output tuples as sets, returning
+	// an error if they aren't equal by set comparison (irrespective of order).
+	unorderedVerifier
+)
+
+type verifierFn func(output *opTestOutput) error
 
 // maybeHasNulls is a helper function that returns whether any of the columns in b
 // (maybe) have nulls.
@@ -82,7 +167,7 @@ func maybeHasNulls(b coldata.Batch) bool {
 	return false
 }
 
-type testRunner func(*testing.T, []tuples, [][]coltypes.T, tuples, verifier, func([]Operator) (Operator, error))
+type testRunner func(*testing.T, []tuples, [][]coltypes.T, tuples, interface{}, func([]Operator) (Operator, error))
 
 // variableOutputBatchSizeInitializer is implemented by operators that can be
 // initialized with variable output size batches. This allows runTests to
@@ -101,7 +186,7 @@ func runTests(
 	t *testing.T,
 	tups []tuples,
 	expected tuples,
-	verifier verifier,
+	verifier interface{},
 	constructor func(inputs []Operator) (Operator, error),
 ) {
 	runTestsWithTyps(t, tups, nil /* typs */, expected, verifier, constructor)
@@ -117,7 +202,7 @@ func runTestsWithTyps(
 	tups []tuples,
 	typs [][]coltypes.T,
 	expected tuples,
-	verifier verifier,
+	verifier interface{},
 	constructor func(inputs []Operator) (Operator, error),
 ) {
 	runTestsWithoutAllNullsInjection(t, tups, typs, expected, verifier, constructor)
@@ -191,6 +276,12 @@ func runTestsWithTyps(
 				"non-nulls in the input tuples, we expect for all nulls injection to "+
 				"change the output")
 		}
+		if c, ok := originalOp.(io.Closer); ok {
+			require.NoError(t, c.Close())
+		}
+		if c, ok := opWithNulls.(io.Closer); ok {
+			require.NoError(t, c.Close())
+		}
 	})
 }
 
@@ -204,96 +295,122 @@ func runTestsWithoutAllNullsInjection(
 	tups []tuples,
 	typs [][]coltypes.T,
 	expected tuples,
-	verifier verifier,
+	verifier interface{},
 	constructor func(inputs []Operator) (Operator, error),
 ) {
+	skipVerifySelAndNullsResets := true
+	var verifyFn verifierFn
+	switch v := verifier.(type) {
+	case verifierType:
+		switch v {
+		case orderedVerifier:
+			verifyFn = (*opTestOutput).Verify
+			// Note that this test makes sense only if we expect tuples to be
+			// returned in the same order (otherwise the second batch's selection
+			// vector or nulls info can be different and that is totally valid).
+			skipVerifySelAndNullsResets = false
+		case unorderedVerifier:
+			verifyFn = (*opTestOutput).VerifyAnyOrder
+		default:
+			execerror.VectorizedInternalPanic(fmt.Sprintf("unexpected verifierType %d", v))
+		}
+	case verifierFn:
+		verifyFn = v
+	}
 	runTestsWithFn(t, tups, typs, func(t *testing.T, inputs []Operator) {
 		op, err := constructor(inputs)
 		if err != nil {
 			t.Fatal(err)
 		}
 		out := newOpTestOutput(op, expected)
-		if err := verifier(out); err != nil {
+		if err := verifyFn(out); err != nil {
 			t.Fatal(err)
 		}
 	})
 
-	t.Run("verifySelAndNullResets", func(t *testing.T) {
-		// This test ensures that operators that "own their own batches", such as
-		// any operator that has to reshape its output, are not affected by
-		// downstream modification of batches.
-		// We run the main loop twice: once to determine what the operator would
-		// output on its second Next call (we need the first call to Next to get a
-		// reference to a batch to modify), and a second time to modify the batch
-		// and verify that this does not change the operator output.
-		// NOTE: this test makes sense only if the operator returns two non-zero
-		// length batches (if not, we short-circuit the test since the operator
-		// doesn't have to restore anything on a zero-length batch).
-		var (
-			secondBatchHasSelection, secondBatchHasNulls bool
-			inputTypes                                   []coltypes.T
-		)
-		for round := 0; round < 2; round++ {
-			inputSources := make([]Operator, len(tups))
-			for i, tup := range tups {
-				if typs != nil {
-					inputTypes = typs[i]
+	if !skipVerifySelAndNullsResets {
+		t.Run("verifySelAndNullResets", func(t *testing.T) {
+			// This test ensures that operators that "own their own batches", such as
+			// any operator that has to reshape its output, are not affected by
+			// downstream modification of batches.
+			// We run the main loop twice: once to determine what the operator would
+			// output on its second Next call (we need the first call to Next to get a
+			// reference to a batch to modify), and a second time to modify the batch
+			// and verify that this does not change the operator output.
+			// NOTE: this test makes sense only if the operator returns two non-zero
+			// length batches (if not, we short-circuit the test since the operator
+			// doesn't have to restore anything on a zero-length batch).
+			var (
+				secondBatchHasSelection, secondBatchHasNulls bool
+				inputTypes                                   []coltypes.T
+			)
+			for round := 0; round < 2; round++ {
+				inputSources := make([]Operator, len(tups))
+				for i, tup := range tups {
+					if typs != nil {
+						inputTypes = typs[i]
+					}
+					inputSources[i] = newOpTestInput(1 /* batchSize */, tup, inputTypes)
 				}
-				inputSources[i] = newOpTestInput(1 /* batchSize */, tup, inputTypes)
-			}
-			op, err := constructor(inputSources)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if vbsiOp, ok := op.(variableOutputBatchSizeInitializer); ok {
-				// initialize the operator with a very small output batch size to
-				// increase the likelihood that multiple batches will be output.
-				vbsiOp.initWithOutputBatchSize(1)
-			} else {
-				op.Init()
-			}
-			ctx := context.Background()
-			b := op.Next(ctx)
-			if b.Length() == 0 {
-				return
-			}
-			if round == 1 {
-				if secondBatchHasSelection {
-					b.SetSelection(false)
-				} else {
-					b.SetSelection(true)
+				op, err := constructor(inputSources)
+				if err != nil {
+					t.Fatal(err)
 				}
-				if secondBatchHasNulls {
-					// ResetInternalBatch will throw away the null information.
-					b.ResetInternalBatch()
+				if vbsiOp, ok := op.(variableOutputBatchSizeInitializer); ok {
+					// initialize the operator with a very small output batch size to
+					// increase the likelihood that multiple batches will be output.
+					vbsiOp.initWithOutputBatchSize(1)
 				} else {
-					for i := 0; i < b.Width(); i++ {
-						b.ColVec(i).Nulls().SetNulls()
+					op.Init()
+				}
+				ctx := context.Background()
+				b := op.Next(ctx)
+				if b.Length() == 0 {
+					return
+				}
+				if round == 1 {
+					if secondBatchHasSelection {
+						b.SetSelection(false)
+					} else {
+						b.SetSelection(true)
+					}
+					if secondBatchHasNulls {
+						// ResetInternalBatch will throw away the null information.
+						b.ResetInternalBatch()
+					} else {
+						for i := 0; i < b.Width(); i++ {
+							b.ColVec(i).Nulls().SetNulls()
+						}
 					}
 				}
-			}
-			b = op.Next(ctx)
-			if b.Length() == 0 {
-				return
-			}
-			if round == 0 {
-				secondBatchHasSelection = b.Selection() != nil
-				secondBatchHasNulls = maybeHasNulls(b)
-			}
-			if round == 1 {
-				if secondBatchHasSelection {
-					assert.NotNil(t, b.Selection())
-				} else {
-					assert.Nil(t, b.Selection())
+				b = op.Next(ctx)
+				if b.Length() == 0 {
+					return
 				}
-				if secondBatchHasNulls {
-					assert.True(t, maybeHasNulls(b))
-				} else {
-					assert.False(t, maybeHasNulls(b))
+				if round == 0 {
+					secondBatchHasSelection = b.Selection() != nil
+					secondBatchHasNulls = maybeHasNulls(b)
+				}
+				if round == 1 {
+					if secondBatchHasSelection {
+						assert.NotNil(t, b.Selection())
+					} else {
+						assert.Nil(t, b.Selection())
+					}
+					if secondBatchHasNulls {
+						assert.True(t, maybeHasNulls(b))
+					} else {
+						assert.False(t, maybeHasNulls(b))
+					}
+				}
+				if c, ok := op.(io.Closer); ok {
+					// Some operators need an explicit Close if not drained completely of
+					// input.
+					assert.NoError(t, c.Close())
 				}
 			}
-		}
-	})
+		})
+	}
 
 	t.Run("randomNullsInjection", func(t *testing.T) {
 		// This test randomly injects nulls in the input tuples and ensures that
@@ -850,6 +967,8 @@ func tupleEquals(expected tuple, actual tuple) bool {
 				if f2, ok := actual[i].(float64); ok {
 					if math.IsNaN(f1) && math.IsNaN(f2) {
 						continue
+					} else if !math.IsNaN(f1) && !math.IsNaN(f2) && math.Abs(f1-f2) < 1e-6 {
+						continue
 					}
 				}
 			}
@@ -893,23 +1012,9 @@ func assertTuplesSetsEqual(expected tuples, actual tuples) error {
 	if len(expected) != len(actual) {
 		return makeError(expected, actual)
 	}
-	actualTupleUsed := make([]bool, len(actual))
-	for _, te := range expected {
-		matched := false
-		for j, ta := range actual {
-			if !actualTupleUsed[j] {
-				if tupleEquals(te, ta) {
-					actualTupleUsed[j] = true
-					matched = true
-					break
-				}
-			}
-		}
-		if !matched {
-			return makeError(expected, actual)
-		}
-	}
-	return nil
+	actual = actual.sort()
+	expected = expected.sort()
+	return assertTuplesOrderedEqual(expected, actual)
 }
 
 // assertTuplesOrderedEqual asserts that two permutations of tuples are equal
@@ -1041,6 +1146,9 @@ func TestRepeatableBatchSource(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	batch := testAllocator.NewMemBatch([]coltypes.T{coltypes.Int64})
 	batchLen := uint16(10)
+	if coldata.BatchSize() < batchLen {
+		batchLen = coldata.BatchSize()
+	}
 	batch.SetLength(batchLen)
 	input := NewRepeatableBatchSource(testAllocator, batch)
 
@@ -1147,6 +1255,11 @@ func (c *chunkingBatchSource) Next(context.Context) coldata.Batch {
 	if c.curIdx >= c.len {
 		return coldata.ZeroBatch
 	}
+	// Explicitly set to false since this could be modified by the downstream
+	// operators. This is sufficient because both the vectors and the nulls are
+	// explicitly set below. ResetInternalBatch cannot be used here because we're
+	// operating on Windows into the vectors.
+	c.batch.SetSelection(false)
 	lastIdx := c.curIdx + uint64(coldata.BatchSize())
 	if lastIdx > c.len {
 		lastIdx = c.len
@@ -1207,4 +1320,14 @@ func (tc *joinTestCase) init() {
 			tc.rightDirections[i] = execinfrapb.Ordering_Column_ASC
 		}
 	}
+}
+
+type sortTestCase struct {
+	description string
+	tuples      tuples
+	expected    tuples
+	logTypes    []types.T
+	ordCols     []execinfrapb.Ordering_Column
+	matchLen    int
+	k           uint16
 }

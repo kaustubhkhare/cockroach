@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/abortspan"
 	"github.com/cockroachdb/cockroach/pkg/storage/batcheval/result"
+	"github.com/cockroachdb/cockroach/pkg/storage/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/rditer"
@@ -58,8 +59,10 @@ func declareKeysEndTxn(
 ) {
 	et := req.(*roachpb.EndTxnRequest)
 	declareKeysWriteTransaction(desc, header, req, spans)
+	var minTxnTS hlc.Timestamp
 	if header.Txn != nil {
 		header.Txn.AssertInitialized(context.TODO())
+		minTxnTS = header.Txn.MinTimestamp
 		abortSpanAccess := spanset.SpanReadOnly
 		if !et.Commit && et.Poison {
 			abortSpanAccess = spanset.SpanReadWrite
@@ -81,11 +84,7 @@ func declareKeysEndTxn(
 		// purpose of acquiring latches. The parts in our Range will
 		// be resolved eagerly.
 		for _, span := range et.IntentSpans {
-			if keys.IsLocal(span.Key) {
-				spans.AddNonMVCC(spanset.SpanReadWrite, span)
-			} else {
-				spans.AddMVCC(spanset.SpanReadWrite, span, header.Timestamp)
-			}
+			spans.AddMVCC(spanset.SpanReadWrite, span, minTxnTS)
 		}
 
 		if et.InternalCommitTrigger != nil {
@@ -481,7 +480,7 @@ func resolveLocalIntents(
 				externalIntents = append(externalIntents, span)
 				return nil
 			}
-			intent := roachpb.MakeIntent(txn, span)
+			intent := roachpb.MakeLockUpdateWithDur(txn, span, lock.Replicated)
 			if len(span.EndKey) == 0 {
 				// For single-key intents, do a KeyAddress-aware check of
 				// whether it's contained in our Range.

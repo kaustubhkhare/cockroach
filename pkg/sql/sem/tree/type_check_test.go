@@ -68,7 +68,6 @@ func TestTypeCheck(t *testing.T) {
 		{`NULLIF(NULL, 2)`, `NULLIF(NULL, 2:::INT8)`},
 		{`NULLIF(2, NULL)`, `NULLIF(2:::INT8, NULL)`},
 		{`NULLIF((1, 2), (1, 3))`, `NULLIF((1:::INT8, 2:::INT8), (1:::INT8, 3:::INT8))`},
-		{`NULLIF(NULL, 0) + NULLIF(NULL, 0)`, `NULL`},
 		{`COALESCE(1, 2, 3, 4, 5)`, `COALESCE(1:::INT8, 2:::INT8, 3:::INT8, 4:::INT8, 5:::INT8)`},
 		{`COALESCE(1, 2.0)`, `COALESCE(1:::DECIMAL, 2.0:::DECIMAL)`},
 		{`COALESCE(NULL, 2)`, `COALESCE(NULL, 2:::INT8)`},
@@ -244,6 +243,10 @@ func TestTypeCheckError(t *testing.T) {
 		{`3:::int[]`, `incompatible type annotation for 3 as int[], found type: int`},
 		{`B'1001'::decimal`, `invalid cast: varbit -> decimal`},
 		{`101.3::bit`, `invalid cast: decimal -> bit`},
+		{`ARRAY[1] = ARRAY['foo']`, `could not parse "foo" as type int`},
+		{`ARRAY[1]::int[] = ARRAY[1.0]::decimal[]`, `unsupported comparison operator: <int[]> = <decimal[]>`},
+		{`ARRAY[1] @> ARRAY['foo']`, `unsupported comparison operator: <int[]> @> <string[]>`},
+		{`ARRAY[1]::int[] @> ARRAY[1.0]::decimal[]`, `unsupported comparison operator: <int[]> @> <decimal[]>`},
 		{
 			`((1,2) AS a)`,
 			`mismatch in tuple definition: 2 expressions, 1 labels`,

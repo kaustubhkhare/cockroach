@@ -130,9 +130,9 @@ func (m *Memo) CheckExpr(e opt.Expr) {
 			}
 		}
 
-	case *DistinctOnExpr:
+	case *DistinctOnExpr, *UpsertDistinctOnExpr:
 		// Check that aggregates can be only FirstAgg or ConstAgg.
-		for _, item := range t.Aggregations {
+		for _, item := range *t.Child(1).(*AggregationsExpr) {
 			switch item.Agg.Op() {
 			case opt.FirstAggOp, opt.ConstAggOp:
 
@@ -202,14 +202,6 @@ func (m *Memo) CheckExpr(e opt.Expr) {
 	case *ConstExpr:
 		if t.Value == tree.DNull {
 			panic(errors.AssertionFailedf("NULL values should always use NullExpr, not ConstExpr"))
-		}
-
-	case *StringAggExpr:
-		if !CanExtractConstDatum(t.Sep) {
-			panic(errors.AssertionFailedf(
-				"second argument to StringAggOp must always be constant, but got %s",
-				log.Safe(e.Child(1).Op()),
-			))
 		}
 
 	default:

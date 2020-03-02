@@ -441,18 +441,25 @@ func (b *logicalPropsBuilder) buildDistinctOnProps(
 	b.buildGroupingExprProps(distinctOn, rel)
 }
 
+func (b *logicalPropsBuilder) buildUpsertDistinctOnProps(
+	distinctOn *UpsertDistinctOnExpr, rel *props.Relational,
+) {
+	b.buildGroupingExprProps(distinctOn, rel)
+}
+
 func (b *logicalPropsBuilder) buildGroupingExprProps(groupExpr RelExpr, rel *props.Relational) {
 	BuildSharedProps(groupExpr, &rel.Shared)
 
 	inputProps := groupExpr.Child(0).(RelExpr).Relational()
 	aggs := *groupExpr.Child(1).(*AggregationsExpr)
 	groupPrivate := groupExpr.Private().(*GroupingPrivate)
+	groupingCols := groupPrivate.GroupingCols
 
 	// Output Columns
 	// --------------
 	// Output columns are the union of grouping columns with columns from the
 	// aggregate projection list.
-	rel.OutputCols = groupPrivate.GroupingCols.Copy()
+	rel.OutputCols = groupingCols.Copy()
 	for i := range aggs {
 		rel.OutputCols.Add(aggs[i].Col)
 	}
@@ -460,7 +467,32 @@ func (b *logicalPropsBuilder) buildGroupingExprProps(groupExpr RelExpr, rel *pro
 	// Not Null Columns
 	// ----------------
 	// Propagate not null setting from input columns that are being grouped.
-	rel.NotNullCols = inputProps.NotNullCols.Intersection(groupPrivate.GroupingCols)
+	rel.NotNullCols = inputProps.NotNullCols.Intersection(groupingCols)
+
+	for i := range aggs {
+		item := &aggs[i]
+		agg := ExtractAggFunc(item.Agg)
+
+		// Some aggregates never return NULL, regardless of input.
+		if opt.AggregateIsNeverNull(agg.Op()) {
+			rel.NotNullCols.Add(item.Col)
+			continue
+		}
+
+		// If there is a possibility that the aggregate function has zero input
+		// rows, then it may return NULL. This is possible with ScalarGroupBy and
+		// with AggFilter.
+		if groupExpr.Op() == opt.ScalarGroupByOp || item.Agg.Op() == opt.AggFilterOp {
+			continue
+		}
+
+		// All PG aggregate functions return a non-NULL result if they have at
+		// least one input row, and if all argument values are non-NULL.
+		inputCols := ExtractAggInputColumns(agg)
+		if inputCols.SubsetOf(inputProps.NotNullCols) {
+			rel.NotNullCols.Add(item.Col)
+		}
+	}
 
 	// Outer Columns
 	// -------------
@@ -471,14 +503,23 @@ func (b *logicalPropsBuilder) buildGroupingExprProps(groupExpr RelExpr, rel *pro
 	// Functional Dependencies
 	// -----------------------
 	rel.FuncDeps.CopyFrom(&inputProps.FuncDeps)
-	if groupPrivate.GroupingCols.Empty() {
-		// Scalar group by has no grouping columns and always a single row.
+	if groupingCols.Empty() {
+		// When there are no grouping columns, then there is a single group, and
+		// therefore at most one output row.
 		rel.FuncDeps.MakeMax1Row(rel.OutputCols)
 	} else {
-		// The grouping columns always form a strict key because the GroupBy
-		// operation eliminates all duplicates in those columns.
+		// Start by eliminating input columns that aren't projected.
 		rel.FuncDeps.ProjectCols(rel.OutputCols)
-		rel.FuncDeps.AddStrictKey(groupPrivate.GroupingCols, rel.OutputCols)
+
+		// The output of most of the grouping operators forms a strict key because
+		// they eliminate all duplicates in the grouping columns. However, the
+		// UpsertDistinctOn operator does not group NULL values together, so it
+		// only forms a lax key when NULL values are possible.
+		if groupExpr.Op() == opt.UpsertDistinctOnOp && !groupingCols.SubsetOf(rel.NotNullCols) {
+			rel.FuncDeps.AddLaxKey(groupingCols, rel.OutputCols)
+		} else {
+			rel.FuncDeps.AddStrictKey(groupingCols, rel.OutputCols)
+		}
 	}
 
 	// Cardinality

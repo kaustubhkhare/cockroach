@@ -34,7 +34,7 @@ func genHashTable(wr io.Writer) error {
 	s = strings.Replace(s, "_BuildType", "{{$rTyp}}", -1)
 
 	assignNeRe := makeFunctionRegex("_ASSIGN_NE", 3)
-	s = assignNeRe.ReplaceAllString(s, `{{.Global.Assign "$1" "$2" "$3"}}`)
+	s = assignNeRe.ReplaceAllString(s, makeTemplateFunctionCall("Global.Assign", 3))
 
 	checkCol := makeFunctionRegex("_CHECK_COL_WITH_NULLS", 7)
 	s = checkCol.ReplaceAllString(s, `{{template "checkColWithNulls" buildDict "Global" . "UseSel" $7}}`)
@@ -43,6 +43,10 @@ func genHashTable(wr io.Writer) error {
 	s = checkColBody.ReplaceAllString(
 		s,
 		`{{template "checkColBody" buildDict "Global" .Global "UseSel" .UseSel "ProbeHasNulls" $7 "BuildHasNulls" $8 "AllowNullEquality" $9}}`)
+
+	checkBody := makeFunctionRegex("_CHECK_BODY", 1)
+	s = checkBody.ReplaceAllString(s,
+		`{{template "checkBody" buildDict "Global" . "IsHashTableInFullMode" $1}}`)
 
 	s = replaceManipulationFuncs(".Global.LTyp", s)
 

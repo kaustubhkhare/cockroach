@@ -121,7 +121,11 @@ func (f *stubFactory) ConstructScalarGroupBy(
 }
 
 func (f *stubFactory) ConstructDistinct(
-	input exec.Node, distinctCols, orderedCols exec.ColumnOrdinalSet, reqOrdering exec.OutputOrdering,
+	input exec.Node,
+	distinctCols, orderedCols exec.ColumnOrdinalSet,
+	reqOrdering exec.OutputOrdering,
+	nullsAreDistinct bool,
+	errorOnDup string,
 ) (exec.Node, error) {
 	return struct{}{}, nil
 }
@@ -188,7 +192,7 @@ func (f *stubFactory) ConstructLimit(
 	return struct{}{}, nil
 }
 
-func (f *stubFactory) ConstructMax1Row(input exec.Node) (exec.Node, error) {
+func (f *stubFactory) ConstructMax1Row(input exec.Node, errorText string) (exec.Node, error) {
 	return struct{}{}, nil
 }
 

@@ -496,6 +496,25 @@ var charts = []sectionDescription{
 		},
 	},
 	{
+		Organization: [][]string{{KVTransactionLayer, "Protected Timestamps", "Reconciliation"}},
+		Charts: []chartDescription{
+			{
+				Title: "Records Processed",
+				Metrics: []string{
+					"kv.protectedts.reconciliation.errors",
+					"kv.protectedts.reconciliation.records_processed",
+					"kv.protectedts.reconciliation.records_removed",
+				},
+			},
+			{
+				Title: "Reconciliation Runs",
+				Metrics: []string{
+					"kv.protectedts.reconciliation.num_runs",
+				},
+			},
+		},
+	},
+	{
 		Organization: [][]string{{KVTransactionLayer, "Garbage Collection (GC)", "Keys"}},
 		Charts: []chartDescription{
 			{
@@ -1375,6 +1394,10 @@ var charts = []sectionDescription{
 			{
 				Title:   "Total Queries",
 				Metrics: []string{"sql.distsql.queries.total"},
+			},
+			{
+				Title:   "Vectorized Temporary Storage Open File Descriptors",
+				Metrics: []string{"sql.distsql.vec.openfds"},
 			},
 		},
 	},

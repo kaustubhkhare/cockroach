@@ -34,17 +34,17 @@ type lockTableWaiterImpl struct {
 	stopper *stop.Stopper
 
 	// Used to push conflicting transactions and resolve conflicting intents.
-	ir intentResolver
+	ir IntentResolver
 
 	// How long to wait until pushing conflicting transactions to detect
 	// dependency cycles.
 	dependencyCyclePushDelay time.Duration
 }
 
-// intentResolver is an interface used by lockTableWaiterImpl to push
+// IntentResolver is an interface used by lockTableWaiterImpl to push
 // transactions and to resolve intents. It contains only the subset of the
 // intentresolver.IntentResolver interface that lockTableWaiterImpl needs.
-type intentResolver interface {
+type IntentResolver interface {
 	// PushTransaction pushes the provided transaction. The method will push the
 	// provided pushee transaction immediately, if possible. Otherwise, it will
 	// block until the pushee transaction is finalized or eventually can be
@@ -54,7 +54,7 @@ type intentResolver interface {
 	) (roachpb.Transaction, *Error)
 
 	// ResolveIntent resolves the provided intent according to the options.
-	ResolveIntent(context.Context, roachpb.Intent, intentresolver.ResolveOptions) *Error
+	ResolveIntent(context.Context, roachpb.LockUpdate, intentresolver.ResolveOptions) *Error
 }
 
 // WaitOn implements the lockTableWaiter interface.
@@ -72,6 +72,36 @@ func (w *lockTableWaiterImpl) WaitOn(
 		case <-newStateC:
 			timerC = nil
 			state := guard.CurState()
+			if !state.held {
+				// If the lock is not held and instead has a reservation, we don't
+				// want to push the reservation transaction. A transaction push will
+				// block until the pushee transaction has either committed, aborted,
+				// pushed, or rolled back savepoints, i.e., there is some state
+				// change that has happened to the transaction record that unblocks
+				// the pusher. It will not unblock merely because a request issued
+				// by the pushee transaction has completed and released a
+				// reservation. Note that:
+				// - reservations are not a guarantee that the lock will be acquired.
+				// - the following two reasons to push do not apply to requests
+				// holding reservations:
+				//  1. competing requests compete at exactly one lock table, so there
+				//  is no possibility of distributed deadlock due to reservations.
+				//  2. the lock table can prioritize requests based on transaction
+				//  priorities.
+				//
+				// TODO(sbhola): remove the need for this by only notifying waiters
+				// for held locks and never for reservations.
+				// TODO(sbhola): now that we never push reservation holders, we
+				// should stop special-casing non-transactional writes and let them
+				// acquire reservations.
+				switch state.stateKind {
+				case waitFor, waitForDistinguished:
+					continue
+				case waitElsewhere:
+					return nil
+				}
+			}
+
 			switch state.stateKind {
 			case waitFor:
 				// waitFor indicates that the request is waiting on another
@@ -227,10 +257,9 @@ func (w *lockTableWaiterImpl) pushTxn(ctx context.Context, req Request, ws waiti
 	//
 	// To do better here, we need per-intent information on whether we need to
 	// poison.
-	resolveIntent := roachpb.Intent{Span: roachpb.Span{Key: ws.key}}
-	resolveIntent.SetTxn(&pusheeTxn)
+	resolve := roachpb.MakeLockUpdateWithDur(&pusheeTxn, roachpb.Span{Key: ws.key}, ws.dur)
 	opts := intentresolver.ResolveOptions{Wait: false, Poison: true}
-	return w.ir.ResolveIntent(ctx, resolveIntent, opts)
+	return w.ir.ResolveIntent(ctx, resolve, opts)
 }
 
 func hasMinPriority(txn *enginepb.TxnMeta) bool {

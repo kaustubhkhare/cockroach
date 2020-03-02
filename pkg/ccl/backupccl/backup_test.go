@@ -380,6 +380,58 @@ func TestBackupRestorePartitioned(t *testing.T) {
 	}
 }
 
+func TestBackupRestoreAppend(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	const numAccounts = 1000
+	ctx, _, sqlDB, _, cleanupFn := backupRestoreTestSetup(t, multiNode, numAccounts, initNone)
+	defer cleanupFn()
+
+	// Ensure that each node has at least one leaseholder. (These splits were
+	// made in backupRestoreTestSetup.) These are wrapped with SucceedsSoon()
+	// because EXPERIMENTAL_RELOCATE can fail if there are other replication
+	// changes happening.
+	for _, stmt := range []string{
+		`ALTER TABLE data.bank EXPERIMENTAL_RELOCATE VALUES (ARRAY[1], 0)`,
+		`ALTER TABLE data.bank EXPERIMENTAL_RELOCATE VALUES (ARRAY[2], 100)`,
+		`ALTER TABLE data.bank EXPERIMENTAL_RELOCATE VALUES (ARRAY[3], 200)`,
+	} {
+		testutils.SucceedsSoon(t, func() error {
+			_, err := sqlDB.DB.ExecContext(ctx, stmt)
+			return err
+		})
+	}
+	const localFoo1, localFoo2, localFoo3 = localFoo + "/1", localFoo + "/2", localFoo + "/3"
+
+	backups := []interface{}{
+		fmt.Sprintf("%s?COCKROACH_LOCALITY=%s", localFoo1, url.QueryEscape("default")),
+		fmt.Sprintf("%s?COCKROACH_LOCALITY=%s", localFoo2, url.QueryEscape("dc=dc1")),
+		fmt.Sprintf("%s?COCKROACH_LOCALITY=%s", localFoo3, url.QueryEscape("dc=dc2")),
+	}
+
+	var tsBefore, ts1, ts2 string
+	sqlDB.QueryRow(t, "SELECT cluster_logical_timestamp()").Scan(&tsBefore)
+
+	sqlDB.Exec(t, "BACKUP DATABASE data TO ($1, $2, $3) AS OF SYSTEM TIME "+tsBefore, backups...)
+
+	sqlDB.QueryRow(t, "UPDATE data.bank SET balance = 100 RETURNING cluster_logical_timestamp()").Scan(&ts1)
+	sqlDB.Exec(t, "BACKUP DATABASE data TO ($1, $2, $3) AS OF SYSTEM TIME "+ts1, backups...)
+
+	sqlDB.QueryRow(t, "UPDATE data.bank SET balance = 200 RETURNING cluster_logical_timestamp()").Scan(&ts2)
+	rowsTS2 := sqlDB.QueryStr(t, "SELECT * from data.bank ORDER BY id")
+	sqlDB.Exec(t, "BACKUP DATABASE data TO ($1, $2, $3) AS OF SYSTEM TIME "+ts2, backups...)
+
+	sqlDB.Exec(t, "ALTER TABLE data.bank RENAME TO data.renamed")
+	sqlDB.Exec(t, "BACKUP DATABASE data TO ($1, $2, $3)", backups...)
+
+	sqlDB.Exec(t, "DROP DATABASE data CASCADE")
+	sqlDB.Exec(t, "RESTORE DATABASE data FROM ($1, $2, $3)", backups...)
+	sqlDB.ExpectErr(t, "relation \"data.bank\" does not exist", "SELECT * FROM data.bank ORDER BY id")
+	sqlDB.CheckQueryResults(t, "SELECT * from data.renamed ORDER BY id", rowsTS2)
+
+	// TODO(dt): test restoring to other backups via AOST.
+}
+
 func TestBackupRestorePartitionedMergeDirectories(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -433,6 +485,24 @@ func TestBackupRestoreNegativePrimaryKey(t *testing.T) {
 	)
 
 	backupAndRestore(ctx, t, tc, []string{localFoo}, []string{localFoo}, numAccounts)
+
+	sqlDB.Exec(t, `SET experimental_enable_primary_key_changes = true`)
+	sqlDB.Exec(t, `CREATE UNIQUE INDEX id2 ON data.bank (id)`)
+	sqlDB.Exec(t, `ALTER TABLE data.bank ALTER PRIMARY KEY USING COLUMNS(id)`)
+
+	var unused string
+	var exportedRows, exportedIndexEntries int
+	sqlDB.QueryRow(t, `BACKUP DATABASE data TO $1`, localFoo+"/alteredPK").Scan(
+		&unused, &unused, &unused, &exportedRows, &exportedIndexEntries, &unused,
+	)
+	if exportedRows != numAccounts {
+		t.Fatalf("expected %d rows, got %d", numAccounts, exportedRows)
+	}
+	expectedIndexEntries := numAccounts * 3 // old PK, new and old secondary idx
+	if exportedIndexEntries != expectedIndexEntries {
+		t.Fatalf("expected %d index entries, got %d", expectedIndexEntries, exportedIndexEntries)
+	}
+
 }
 
 func backupAndRestore(
@@ -501,26 +571,37 @@ func backupAndRestore(
 			t.Fatalf("expected %d rows for %d accounts, got %d", expected, numAccounts, exported.rows)
 		}
 
-		sqlDB.Exec(t, `SET CLUSTER SETTING sql.stats.automatic_collection.enabled=false`)
-		const stmt = "SELECT payload FROM system.jobs ORDER BY created DESC LIMIT 1"
-		var payloadBytes []byte
-		sqlDB.QueryRow(t, stmt).Scan(&payloadBytes)
+		found := false
+		const stmt = "SELECT payload FROM system.jobs ORDER BY created DESC LIMIT 10"
+		for rows := sqlDB.Query(t, stmt); rows.Next(); {
+			var payloadBytes []byte
+			if err := rows.Scan(&payloadBytes); err != nil {
+				t.Fatal(err)
+			}
 
-		payload := &jobspb.Payload{}
-		if err := protoutil.Unmarshal(payloadBytes, payload); err != nil {
-			t.Fatal("cannot unmarshal job payload from system.jobs")
-		}
+			payload := &jobspb.Payload{}
+			if err := protoutil.Unmarshal(payloadBytes, payload); err != nil {
+				t.Fatal("cannot unmarshal job payload from system.jobs")
+			}
 
-		backupManifest := &backupccl.BackupManifest{}
-		backupDetails := payload.Details.(*jobspb.Payload_Backup).Backup
-		if err := protoutil.Unmarshal(backupDetails.BackupManifest, backupManifest); err != nil {
-			t.Fatal("cannot unmarshal backup descriptor from job payload from system.jobs")
+			backupManifest := &backupccl.BackupManifest{}
+			backupPayload, ok := payload.Details.(*jobspb.Payload_Backup)
+			if !ok {
+				t.Logf("job %T is not a backup: %v", payload.Details, payload.Details)
+				continue
+			}
+			backupDetails := backupPayload.Backup
+			found = true
+			if err := protoutil.Unmarshal(backupDetails.BackupManifest, backupManifest); err != nil {
+				t.Fatal("cannot unmarshal backup descriptor from job payload from system.jobs")
+			}
+			if backupManifest.Statistics != nil {
+				t.Fatal("expected statistics field of backup descriptor payload to be nil")
+			}
 		}
-		if backupManifest.Statistics != nil {
-			t.Fatal("expected statistics field of backup descriptor payload to be nil")
+		if !found {
+			t.Fatal("scanned job rows did not contain a backup!")
 		}
-
-		sqlDB.ExpectErr(t, "already contains a BACKUP file", backupQuery, backupURIArgs...)
 	}
 
 	// Start a new cluster to restore into.
@@ -2328,27 +2409,50 @@ func TestRestoreAsOfSystemTime(t *testing.T) {
 
 		// fullBackup covers up to ts[2], inc to ts[5], inc2 to > ts[8].
 		sqlDB.ExpectErr(
-			t, "incompatible RESTORE timestamp",
+			t, "invalid RESTORE timestamp",
 			fmt.Sprintf(`RESTORE data.* FROM $1 AS OF SYSTEM TIME %s WITH into_db='err'`, ts[3]),
 			fullBackup,
 		)
 
 		for _, i := range ts {
-			sqlDB.ExpectErr(
-				t, "incompatible RESTORE timestamp",
-				fmt.Sprintf(`RESTORE data.* FROM $1 AS OF SYSTEM TIME %s WITH into_db='err'`, i),
-				latestBackup,
-			)
 
-			sqlDB.ExpectErr(
-				t, "incompatible RESTORE timestamp",
-				fmt.Sprintf(`RESTORE data.* FROM $1, $2, $3 AS OF SYSTEM TIME %s WITH into_db='err'`, i),
-				latestBackup, incLatestBackup, inc2LatestBackup,
-			)
+			if i == ts[2] {
+				// latestBackup is _at_ ts2 so that is the time, and the only time, at
+				// which restoring it is allowed.
+				sqlDB.Exec(
+					t, fmt.Sprintf(`RESTORE data.* FROM $1 AS OF SYSTEM TIME %s WITH into_db='err'`, i),
+					latestBackup,
+				)
+				sqlDB.Exec(t, `DROP DATABASE err; CREATE DATABASE err`)
+			} else {
+				sqlDB.ExpectErr(
+					t, "invalid RESTORE timestamp",
+					fmt.Sprintf(`RESTORE data.* FROM $1 AS OF SYSTEM TIME %s WITH into_db='err'`, i),
+					latestBackup,
+				)
+			}
+
+			if i == ts[2] || i == ts[5] {
+				// latestBackup is _at_ ts2 and incLatestBackup is at ts5, so either of
+				// those are valid for the chain (latest,incLatest,inc2Latest). In fact
+				// there's a third time -- that of inc2Latest, that is valid as well but
+				// it isn't fixed when created above so we know it / test for it.
+				sqlDB.Exec(
+					t, fmt.Sprintf(`RESTORE data.* FROM $1, $2, $3 AS OF SYSTEM TIME %s WITH into_db='err'`, i),
+					latestBackup, incLatestBackup, inc2LatestBackup,
+				)
+				sqlDB.Exec(t, `DROP DATABASE err; CREATE DATABASE err`)
+			} else {
+				sqlDB.ExpectErr(
+					t, "invalid RESTORE timestamp",
+					fmt.Sprintf(`RESTORE data.* FROM $1, $2, $3 AS OF SYSTEM TIME %s WITH into_db='err'`, i),
+					latestBackup, incLatestBackup, inc2LatestBackup,
+				)
+			}
 		}
 
 		sqlDB.ExpectErr(
-			t, "incompatible RESTORE timestamp",
+			t, "invalid RESTORE timestamp",
 			fmt.Sprintf(`RESTORE data.* FROM $1 AS OF SYSTEM TIME %s WITH into_db='err'`, after),
 			latestBackup,
 		)
@@ -2946,7 +3050,7 @@ func TestBackupAzureAccountName(t *testing.T) {
 	}
 
 	// Verify newlines in the account name cause an error.
-	sqlDB.ExpectErr(t, "azure: account name is not valid", `backup database d to $1`, url.String())
+	sqlDB.ExpectErr(t, "azure: account name is not valid", `backup database data to $1`, url.String())
 }
 
 // If an operator issues a bad query or if a deploy contains a bug that corrupts

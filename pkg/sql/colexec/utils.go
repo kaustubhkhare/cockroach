@@ -11,9 +11,13 @@
 package colexec
 
 import (
+	"context"
+
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 )
 
@@ -29,6 +33,14 @@ var (
 	zeroInt64Value    int64
 	zeroIntervalValue duration.Duration
 )
+
+// decimalOverloadScratch is a utility struct that helps us avoid allocations
+// of temporary decimals on every overloaded operation with them. In order for
+// the templates to see it correctly, a local variable named `scratch` of this
+// type must be declared before the inlined overloaded code.
+type decimalOverloadScratch struct {
+	tmpDec1, tmpDec2 apd.Decimal
+}
 
 // CopyBatch copies the original batch and returns that copy. However, note that
 // the underlying capacity might be different (a new batch is created only with
@@ -52,4 +64,75 @@ func CopyBatch(allocator *Allocator, original coldata.Batch) coldata.Batch {
 		}
 	})
 	return b
+}
+
+// makeWindowIntoBatch updates windowedBatch so that it provides a "window"
+// into inputBatch starting at tuple index startIdx. It handles selection
+// vectors on inputBatch as well (in which case windowedBatch will also have a
+// "windowed" selection vector).
+func makeWindowIntoBatch(
+	windowedBatch, inputBatch coldata.Batch, startIdx uint16, inputTypes []coltypes.T,
+) {
+	inputBatchLen := inputBatch.Length()
+	windowStart := uint64(startIdx)
+	windowEnd := uint64(inputBatchLen)
+	if sel := inputBatch.Selection(); sel != nil {
+		// We have a selection vector on the input batch, and in order to avoid
+		// deselecting (i.e. moving the data over), we will provide an adjusted
+		// selection vector to the windowed batch as well.
+		windowedBatch.SetSelection(true)
+		windowIntoSel := sel[startIdx:inputBatchLen]
+		copy(windowedBatch.Selection(), windowIntoSel)
+		maxSelIdx := uint16(0)
+		for _, selIdx := range windowIntoSel {
+			if selIdx > maxSelIdx {
+				maxSelIdx = selIdx
+			}
+		}
+		windowStart = 0
+		windowEnd = uint64(maxSelIdx + 1)
+	} else {
+		windowedBatch.SetSelection(false)
+	}
+	for i, typ := range inputTypes {
+		window := inputBatch.ColVec(i).Window(typ, windowStart, windowEnd)
+		windowedBatch.ReplaceCol(window, i)
+	}
+	windowedBatch.SetLength(inputBatchLen - startIdx)
+}
+
+func newPartitionerToOperator(
+	allocator *Allocator,
+	types []coltypes.T,
+	partitioner colcontainer.PartitionedQueue,
+	partitionIdx int,
+) *partitionerToOperator {
+	return &partitionerToOperator{
+		partitioner:  partitioner,
+		partitionIdx: partitionIdx,
+		batch:        allocator.NewMemBatchNoCols(types, 0 /* size */),
+	}
+}
+
+// partitionerToOperator is an Operator that Dequeue's from the corresponding
+// partition on every call to Next. It is a converter from filled in
+// PartitionedQueue to Operator.
+type partitionerToOperator struct {
+	ZeroInputNode
+	NonExplainable
+
+	partitioner  colcontainer.PartitionedQueue
+	partitionIdx int
+	batch        coldata.Batch
+}
+
+var _ Operator = &partitionerToOperator{}
+
+func (p *partitionerToOperator) Init() {}
+
+func (p *partitionerToOperator) Next(ctx context.Context) coldata.Batch {
+	if err := p.partitioner.Dequeue(ctx, p.partitionIdx, p.batch); err != nil {
+		execerror.VectorizedInternalPanic(err)
+	}
+	return p.batch
 }

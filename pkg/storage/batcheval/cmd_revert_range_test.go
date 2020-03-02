@@ -134,9 +134,9 @@ func TestCmdRevertRange(t *testing.T) {
 				StartKey: roachpb.RKey(startKey),
 				EndKey:   roachpb.RKey(endKey),
 			}
-			cArgs := CommandArgs{Header: roachpb.Header{RangeID: desc.RangeID, Timestamp: tsC}, MaxKeys: 2}
-			evalCtx := &mockEvalCtx{desc: &desc, clock: hlc.NewClock(hlc.UnixNano, time.Nanosecond), stats: stats}
-			cArgs.EvalCtx = evalCtx
+			cArgs := CommandArgs{Header: roachpb.Header{RangeID: desc.RangeID, Timestamp: tsC, MaxSpanRequestKeys: 2}}
+			evalCtx := &MockEvalCtx{Desc: &desc, Clock: hlc.NewClock(hlc.UnixNano, time.Nanosecond), Stats: stats}
+			cArgs.EvalCtx = evalCtx.EvalContext()
 			afterStats := getStats(t, eng)
 			for _, tc := range []struct {
 				name     string
@@ -190,7 +190,7 @@ func TestCmdRevertRange(t *testing.T) {
 			t.Run("checks gc threshold", func(t *testing.T) {
 				batch := &wrappedBatch{Batch: eng.NewBatch()}
 				defer batch.Close()
-				evalCtx.gcThreshold = tsB
+				evalCtx.GCThreshold = tsB
 				cArgs.Args = &roachpb.RevertRangeRequest{
 					RequestHeader: roachpb.RequestHeader{Key: startKey, EndKey: endKey}, TargetTime: tsB,
 				}
@@ -221,7 +221,7 @@ func TestCmdRevertRange(t *testing.T) {
 
 			cArgs.Header.Timestamp = tsD
 			// Re-set EvalCtx to pick up revised stats.
-			cArgs.EvalCtx = &mockEvalCtx{desc: &desc, clock: hlc.NewClock(hlc.UnixNano, time.Nanosecond), stats: stats}
+			cArgs.EvalCtx = (&MockEvalCtx{Desc: &desc, Clock: hlc.NewClock(hlc.UnixNano, time.Nanosecond), Stats: stats}).EvalContext()
 			for _, tc := range []struct {
 				name        string
 				ts          hlc.Timestamp

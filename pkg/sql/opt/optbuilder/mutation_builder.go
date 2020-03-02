@@ -298,7 +298,7 @@ func (mb *mutationBuilder) buildInputForUpdate(
 		}
 
 		if !pkCols.Empty() {
-			mb.outScope = mb.b.buildDistinctOn(pkCols, mb.outScope)
+			mb.outScope = mb.b.buildDistinctOn(pkCols, mb.outScope, false /* forUpsert */)
 		}
 	}
 
@@ -1434,6 +1434,17 @@ func (mb *mutationBuilder) makeFKInputScan(
 		ID:           mb.b.factory.Metadata().NextUniqueID(),
 	})
 	return scan, outCols
+}
+
+// getIndexLaxKeyOrdinals returns the ordinals of all lax key columns in the
+// given index. A column's ordinal is the ordered position of that column in the
+// owning table.
+func getIndexLaxKeyOrdinals(index cat.Index) util.FastIntSet {
+	var keyOrds util.FastIntSet
+	for i, n := 0, index.LaxKeyColumnCount(); i < n; i++ {
+		keyOrds.Add(index.Column(i).Ordinal)
+	}
+	return keyOrds
 }
 
 // findNotNullIndexCol finds the first not-null column in the given index and

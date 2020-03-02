@@ -807,6 +807,7 @@ EXECGEN_TARGETS = \
   pkg/sql/colexec/distinct.eg.go \
   pkg/sql/colexec/hashjoiner.eg.go \
   pkg/sql/colexec/hashtable.eg.go \
+  pkg/sql/colexec/hash_aggregator.eg.go \
   pkg/sql/colexec/hash_utils.eg.go \
   pkg/sql/colexec/like_ops.eg.go \
   pkg/sql/colexec/mergejoinbase.eg.go \
@@ -1202,7 +1203,7 @@ UI_JS_OSS := pkg/ui/src/js/protos.js
 UI_TS_OSS := pkg/ui/src/js/protos.d.ts
 UI_PROTOS_OSS := $(UI_JS_OSS) $(UI_TS_OSS)
 
-CPP_PROTOS := $(filter %/roachpb/metadata.proto %/roachpb/data.proto %/roachpb/internal.proto %/roachpb/errors.proto %/roachpb/api.proto %util/tracing/recorded_span.proto %/engine/enginepb/mvcc.proto %/engine/enginepb/mvcc3.proto %/engine/enginepb/file_registry.proto %/engine/enginepb/rocksdb.proto %/hlc/legacy_timestamp.proto %/hlc/timestamp.proto %/log/log.proto %/unresolved_addr.proto,$(GO_PROTOS))
+CPP_PROTOS := $(filter %/roachpb/api.proto %/roachpb/metadata.proto %/roachpb/data.proto %/roachpb/internal.proto %/roachpb/errors.proto %util/tracing/recorded_span.proto %/concurrency/lock/locking.proto %/engine/enginepb/mvcc.proto %/engine/enginepb/mvcc3.proto %/engine/enginepb/file_registry.proto %/engine/enginepb/rocksdb.proto %/hlc/legacy_timestamp.proto %/hlc/timestamp.proto %/log/log.proto %/unresolved_addr.proto,$(GO_PROTOS))
 CPP_HEADERS := $(subst ./pkg,$(CPP_PROTO_ROOT),$(CPP_PROTOS:%.proto=%.pb.h))
 CPP_SOURCES := $(subst ./pkg,$(CPP_PROTO_ROOT),$(CPP_PROTOS:%.proto=%.pb.cc))
 
@@ -1339,7 +1340,7 @@ pkg/ui/dist/%.ccl.dll.js pkg/ui/%.ccl.manifest.json: pkg/ui/webpack.%.js pkg/ui/
 
 .PHONY: ui-test
 ui-test: $(UI_CCL_DLLS) $(UI_CCL_MANIFESTS)
-	@echo "would run this but this is skipped pending #42365:" $(NODE_RUN) -C pkg/ui $(KARMA) start
+	$(NODE_RUN) -C pkg/ui $(KARMA) start
 
 .PHONY: ui-test-watch
 ui-test-watch: $(UI_CCL_DLLS) $(UI_CCL_MANIFESTS)
@@ -1495,7 +1496,7 @@ pkg/col/coldata/vec.eg.go: pkg/col/coldata/vec_tmpl.go
 pkg/sql/colexec/and_or_projection.eg.go: pkg/sql/colexec/and_or_projection_tmpl.go
 pkg/sql/colexec/any_not_null_agg.eg.go: pkg/sql/colexec/any_not_null_agg_tmpl.go
 pkg/sql/colexec/avg_agg.eg.go: pkg/sql/colexec/avg_agg_tmpl.go
-pkg/sql/colexec/boolean_agg.eg.go: pkg/sql/colexec/boolean_agg_tmpl.go
+pkg/sql/colexec/bool_and_or_agg.eg.go: pkg/sql/colexec/bool_and_or_agg_tmpl.go
 pkg/sql/colexec/cast.eg.go: pkg/sql/colexec/cast_tmpl.go
 pkg/sql/colexec/const.eg.go: pkg/sql/colexec/const_tmpl.go
 pkg/sql/colexec/count_agg.eg.go: pkg/sql/colexec/count_agg_tmpl.go
@@ -1503,6 +1504,7 @@ pkg/sql/colexec/distinct.eg.go: pkg/sql/colexec/distinct_tmpl.go
 pkg/sql/colexec/hashjoiner.eg.go: pkg/sql/colexec/hashjoiner_tmpl.go
 pkg/sql/colexec/hashtable.eg.go: pkg/sql/colexec/hashtable_tmpl.go
 pkg/sql/colexec/hash_utils.eg.go: pkg/sql/colexec/hash_utils_tmpl.go
+pkg/sql/colexec/like_ops.eg.go: pkg/sql/colexec/selection_ops_tmpl.go
 pkg/sql/colexec/mergejoinbase.eg.go: pkg/sql/colexec/mergejoinbase_tmpl.go
 pkg/sql/colexec/mergejoiner_fullouter.eg.go: pkg/sql/colexec/mergejoiner_tmpl.go
 pkg/sql/colexec/mergejoiner_inner.eg.go: pkg/sql/colexec/mergejoiner_tmpl.go
@@ -1512,6 +1514,7 @@ pkg/sql/colexec/mergejoiner_leftsemi.eg.go: pkg/sql/colexec/mergejoiner_tmpl.go
 pkg/sql/colexec/mergejoiner_rightouter.eg.go: pkg/sql/colexec/mergejoiner_tmpl.go
 pkg/sql/colexec/min_max_agg.eg.go: pkg/sql/colexec/min_max_agg_tmpl.go
 pkg/sql/colexec/orderedsynchronizer.eg.go: pkg/sql/colexec/orderedsynchronizer_tmpl.go
+pkg/sql/colexec/overloads_test_utils.eg.go: pkg/sql/colexec/selection_ops_tmpl.go
 pkg/sql/colexec/proj_const_left_ops.eg.go: pkg/sql/colexec/proj_const_ops_tmpl.go
 pkg/sql/colexec/proj_const_right_ops.eg.go: pkg/sql/colexec/proj_const_ops_tmpl.go
 pkg/sql/colexec/proj_non_const_ops.eg.go: pkg/sql/colexec/proj_non_const_ops_tmpl.go
@@ -1667,7 +1670,7 @@ $(testbins): bin/%: bin/%.d | bin/prereqs $(SUBMODULES_TARGET)
 	@echo go test -c $($*-package)
 	bin/prereqs -bin-name=$* -test $($*-package) > $@.d.tmp
 	mv -f $@.d.tmp $@.d
-	$(xgo) test $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -c -o $@ $($*-package)
+	$(xgo) test $(GOTESTFLAGS) $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -c -o $@ $($*-package)
 
 bin/prereqs: ./pkg/cmd/prereqs/*.go | bin/.submodules-initialized
 	@echo go install -v ./pkg/cmd/prereqs

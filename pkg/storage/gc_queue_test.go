@@ -451,6 +451,7 @@ func TestGCQueueProcess(t *testing.T) {
 				// Overwrite the timestamps set by newTransaction().
 				txn.ReadTimestamp = datum.ts
 				txn.WriteTimestamp = datum.ts
+				txn.MinTimestamp = datum.ts
 				txn.DeprecatedOrigTimestamp = datum.ts
 				assignSeqNumsForReqs(txn, &dArgs)
 			}
@@ -468,6 +469,7 @@ func TestGCQueueProcess(t *testing.T) {
 				// Overwrite the timestamps set by newTransaction().
 				txn.ReadTimestamp = datum.ts
 				txn.WriteTimestamp = datum.ts
+				txn.MinTimestamp = datum.ts
 				txn.DeprecatedOrigTimestamp = datum.ts
 				assignSeqNumsForReqs(txn, &pArgs)
 			}
@@ -516,7 +518,7 @@ func TestGCQueueProcess(t *testing.T) {
 			func(ctx context.Context, intents []roachpb.Intent) error {
 				return nil
 			},
-			func(ctx context.Context, txn *roachpb.Transaction, intents []roachpb.Intent) error {
+			func(ctx context.Context, txn *roachpb.Transaction, intents []roachpb.LockUpdate) error {
 				return nil
 			})
 	}()

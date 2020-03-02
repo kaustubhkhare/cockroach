@@ -573,8 +573,8 @@ DBIterState DBCheckForKeyCollisions(DBIterator* existingIter, DBIterator* sstIte
         // target key space, which will require appropriate resolution logic.
         cockroach::roachpb::WriteIntentError err;
         cockroach::roachpb::Intent* intent = err.add_intents();
-        intent->mutable_span()->set_key(existingIter->rep->key().data(),
-                                        existingIter->rep->key().size());
+        intent->mutable_single_key_span()->set_key(existingIter->rep->key().data(),
+                                                   existingIter->rep->key().size());
         intent->mutable_txn()->CopyFrom(meta.txn());
 
         *write_intent = ToDBString(err.SerializeAsString());
@@ -1089,7 +1089,7 @@ DBStatus DBExportToSst(DBKey start, DBKey end, bool export_all_revisions,
   DBIncrementalIterator iter(engine, iter_opts, start, end, write_intent);
 
   roachpb::BulkOpSummary bulkop_summary;
-  RowCounter row_counter;
+  RowCounter row_counter(&bulkop_summary);
 
   bool skip_current_key_versions = !export_all_revisions;
   DBIterState state;
@@ -1153,7 +1153,7 @@ DBStatus DBExportToSst(DBKey start, DBKey end, bool export_all_revisions,
       return status;
     }
 
-    if (!row_counter.Count((iter.key()), &bulkop_summary)) {
+    if (!row_counter.Count(iter.key())) {
       return ToDBString("Error in row counter");
     }
     const int64_t new_size = cur_size + decoded_key.size() + iter.value().size();

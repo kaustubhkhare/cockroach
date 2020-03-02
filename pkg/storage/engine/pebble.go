@@ -18,6 +18,7 @@ import (
 	"io/ioutil"
 	"os"
 	"sort"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -33,6 +34,50 @@ import (
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/pkg/errors"
 )
+
+// MVCCKeyCompare compares cockroach keys, including the MVCC timestamps.
+func MVCCKeyCompare(a, b []byte) int {
+	// NB: For performance, this routine manually splits the key into the
+	// user-key and timestamp components rather than using SplitMVCCKey. Don't
+	// try this at home kids: use SplitMVCCKey.
+
+	aEnd := len(a) - 1
+	bEnd := len(b) - 1
+	if aEnd < 0 || bEnd < 0 {
+		// This should never happen unless there is some sort of corruption of
+		// the keys. This is a little bizarre, but the behavior exactly matches
+		// engine/db.cc:DBComparator.
+		return bytes.Compare(a, b)
+	}
+
+	// Compute the index of the separator between the key and the timestamp.
+	aSep := aEnd - int(a[aEnd])
+	bSep := bEnd - int(b[bEnd])
+	if aSep < 0 || bSep < 0 {
+		// This should never happen unless there is some sort of corruption of
+		// the keys. This is a little bizarre, but the behavior exactly matches
+		// engine/db.cc:DBComparator.
+		return bytes.Compare(a, b)
+	}
+
+	// Compare the "user key" part of the key.
+	if c := bytes.Compare(a[:aSep], b[:bSep]); c != 0 {
+		return c
+	}
+
+	// Compare the timestamp part of the key.
+	aTS := a[aSep:aEnd]
+	bTS := b[bSep:bEnd]
+	if len(aTS) == 0 {
+		if len(bTS) == 0 {
+			return 0
+		}
+		return -1
+	} else if len(bTS) == 0 {
+		return 1
+	}
+	return bytes.Compare(bTS, aTS)
+}
 
 // MVCCComparer is a pebble.Comparer object that implements MVCC-specific
 // comparator settings for use with Pebble.
@@ -232,13 +277,21 @@ var PebbleTablePropertyCollectors = []func() pebble.TablePropertyCollector{
 
 // DefaultPebbleOptions returns the default pebble options.
 func DefaultPebbleOptions() *pebble.Options {
+	// In RocksDB, the concurrency setting corresponds to both flushes and
+	// compactions. In Pebble, there is always a slot for a flush, and
+	// compactions are counted separately.
+	maxConcurrentCompactions := rocksdbConcurrency - 1
+	if maxConcurrentCompactions < 1 {
+		maxConcurrentCompactions = 1
+	}
+
 	opts := &pebble.Options{
 		Comparer:                    MVCCComparer,
 		L0CompactionThreshold:       2,
 		L0StopWritesThreshold:       1000,
 		LBaseMaxBytes:               64 << 20, // 64 MB
 		Levels:                      make([]pebble.LevelOptions, 7),
-		MaxConcurrentCompactions:    2,
+		MaxConcurrentCompactions:    maxConcurrentCompactions,
 		MemTableSize:                64 << 20, // 64 MB
 		MemTableStopWritesThreshold: 4,
 		Merger:                      MVCCMerger,
@@ -272,16 +325,34 @@ func DefaultPebbleOptions() *pebble.Options {
 	return opts
 }
 
+var pebbleLog *log.SecondaryLogger
+
+// InitPebbleLogger initializes the logger to use for Pebble log messages. If
+// not called, WARNING, ERROR, and FATAL logs will be output to the normal
+// CockroachDB log.
+func InitPebbleLogger(ctx context.Context) {
+	pebbleLog = log.NewSecondaryLogger(ctx, nil, "pebble",
+		true /* enableGC */, false /* forceSyncWrites */, false /* enableMsgCount */)
+}
+
 type pebbleLogger struct {
-	ctx context.Context
+	ctx   context.Context
+	depth int
 }
 
 func (l pebbleLogger) Infof(format string, args ...interface{}) {
-	log.InfofDepth(l.ctx, 2, format, args...)
+	if pebbleLog != nil {
+		pebbleLog.LogfDepth(l.ctx, l.depth, format, args...)
+		// Only log INFO logs to the normal CockroachDB log at --v=3 and above.
+		if !log.V(3) {
+			return
+		}
+	}
+	log.InfofDepth(l.ctx, l.depth, format, args...)
 }
 
 func (l pebbleLogger) Fatalf(format string, args ...interface{}) {
-	log.FatalfDepth(l.ctx, 2, format, args...)
+	log.FatalfDepth(l.ctx, l.depth, format, args...)
 }
 
 // PebbleConfig holds all configuration parameters and knobs used in setting up
@@ -340,6 +411,11 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (*Pebble, error) {
 	// cfg.FS and cfg.ReadOnly later on.
 	cfg.Opts.EnsureDefaults()
 	cfg.Opts.ErrorIfNotExists = cfg.MustExist
+	if settings := cfg.Settings; settings != nil {
+		cfg.Opts.WALMinSyncInterval = func() time.Duration {
+			return minWALSyncInterval.Get(&settings.SV)
+		}
+	}
 
 	var auxDir string
 	if cfg.Dir == "" {
@@ -393,10 +469,15 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (*Pebble, error) {
 
 	// The context dance here is done so that we have a clean context without
 	// timeouts that has a copy of the log tags.
+	logCtx := logtags.WithTags(context.Background(), logtags.FromContext(ctx))
 	cfg.Opts.Logger = pebbleLogger{
-		ctx: logtags.WithTags(context.Background(), logtags.FromContext(ctx)),
+		ctx:   logCtx,
+		depth: 1,
 	}
-	cfg.Opts.EventListener = pebble.MakeLoggingEventListener(cfg.Opts.Logger)
+	cfg.Opts.EventListener = pebble.MakeLoggingEventListener(pebbleLogger{
+		ctx:   logCtx,
+		depth: 2, // skip over the EventListener stack frame
+	})
 
 	db, err := pebble.Open(cfg.StorageConfig.Dir, cfg.Opts)
 	if err != nil {
@@ -506,7 +587,13 @@ func (p *Pebble) Get(key MVCCKey) ([]byte, error) {
 	if len(key.Key) == 0 {
 		return nil, emptyKeyError()
 	}
-	ret, err := p.db.Get(EncodeKey(key))
+	ret, closer, err := p.db.Get(EncodeKey(key))
+	if closer != nil {
+		retCopy := make([]byte, len(ret))
+		copy(retCopy, ret)
+		ret = retCopy
+		closer.Close()
+	}
 	if err == pebble.ErrNotFound || len(ret) == 0 {
 		return nil, nil
 	}
@@ -521,12 +608,6 @@ func (p *Pebble) GetCompactionStats() string {
 	return "\n" + p.db.Metrics().String()
 }
 
-// GetTickersAndHistograms implements the Engine interface.
-func (p *Pebble) GetTickersAndHistograms() (*enginepb.TickersAndHistograms, error) {
-	// TODO(hueypark): Implement this.
-	return nil, nil
-}
-
 // GetProto implements the Engine interface.
 func (p *Pebble) GetProto(
 	key MVCCKey, msg protoutil.Message,
@@ -534,15 +615,21 @@ func (p *Pebble) GetProto(
 	if len(key.Key) == 0 {
 		return false, 0, 0, emptyKeyError()
 	}
-	val, err := p.Get(key)
-	if err != nil || val == nil {
-		return false, 0, 0, err
+	encodedKey := EncodeKey(key)
+	val, closer, err := p.db.Get(encodedKey)
+	if closer != nil {
+		if msg != nil {
+			err = protoutil.Unmarshal(val, msg)
+		}
+		keyBytes = int64(len(encodedKey))
+		valBytes = int64(len(val))
+		closer.Close()
+		return true, keyBytes, valBytes, err
 	}
-
-	err = protoutil.Unmarshal(val, msg)
-	keyBytes = int64(key.Len())
-	valBytes = int64(len(val))
-	return true, keyBytes, valBytes, err
+	if err == pebble.ErrNotFound {
+		return false, 0, 0, nil
+	}
+	return false, 0, 0, err
 }
 
 // Iterate implements the Engine interface.
@@ -1108,7 +1195,13 @@ func (p *pebbleSnapshot) Get(key MVCCKey) ([]byte, error) {
 		return nil, emptyKeyError()
 	}
 
-	ret, err := p.snapshot.Get(EncodeKey(key))
+	ret, closer, err := p.snapshot.Get(EncodeKey(key))
+	if closer != nil {
+		retCopy := make([]byte, len(ret))
+		copy(retCopy, ret)
+		ret = retCopy
+		closer.Close()
+	}
 	if err == pebble.ErrNotFound || len(ret) == 0 {
 		return nil, nil
 	}
@@ -1122,16 +1215,21 @@ func (p *pebbleSnapshot) GetProto(
 	if len(key.Key) == 0 {
 		return false, 0, 0, emptyKeyError()
 	}
-
-	val, err := p.snapshot.Get(EncodeKey(key))
-	if err != nil || val == nil {
-		return false, 0, 0, err
+	encodedKey := EncodeKey(key)
+	val, closer, err := p.snapshot.Get(encodedKey)
+	if closer != nil {
+		if msg != nil {
+			err = protoutil.Unmarshal(val, msg)
+		}
+		keyBytes = int64(len(encodedKey))
+		valBytes = int64(len(val))
+		closer.Close()
+		return true, keyBytes, valBytes, err
 	}
-
-	err = protoutil.Unmarshal(val, msg)
-	keyBytes = int64(key.Len())
-	valBytes = int64(len(val))
-	return true, keyBytes, valBytes, err
+	if err == pebble.ErrNotFound {
+		return false, 0, 0, nil
+	}
+	return false, 0, 0, err
 }
 
 // Iterate implements the Reader interface.

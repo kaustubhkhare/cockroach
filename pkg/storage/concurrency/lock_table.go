@@ -26,7 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
-	"github.com/google/btree"
 )
 
 // The kind of waiting that the request is subject to. See the detailed comment
@@ -49,6 +48,7 @@ type waitingState struct {
 	// request is waiting for.
 	txn         *enginepb.TxnMeta  // always non-nil
 	ts          hlc.Timestamp      // the timestamp of the transaction that is causing the wait
+	dur         lock.Durability    // the durability of the lock that is causing the wait
 	key         roachpb.Key        // the key of the lock that is causing the wait
 	held        bool               // is the lock currently held?
 	access      spanset.SpanAccess // currently only SpanReadWrite
@@ -57,7 +57,6 @@ type waitingState struct {
 
 // Implementation
 // TODO(sbhola):
-// - use the cow btree.
 // - proper error strings and give better explanation to all panics.
 // - metrics about lockTable state to export to observability debug pages:
 //   number of locks, number of waiting requests, wait time?, ...
@@ -66,12 +65,16 @@ type waitingState struct {
 type treeMu struct {
 	mu syncutil.RWMutex // Protects everything in this struct.
 
+	// For assigning sequence numbers to the lockState objects as required by
+	// the util/interval/generic type contract.
+	lockIDSeqNum uint64
+
 	// Container for lockState structs. Locks that are not held or reserved and
 	// have no waiting requests are garbage collected. Additionally, locks that
 	// are only held with Replicated durability and have no waiting requests may
 	// also be garbage collected since their state can be recovered from
 	// persistent storage.
-	*btree.BTree
+	btree
 
 	// For constraining memory consumption. We need better memory accounting
 	// than this.
@@ -130,14 +133,6 @@ type lockTableImpl struct {
 	locks [spanset.NumSpanScope]treeMu
 
 	maxLocks int64
-}
-
-func newLockTable(maxLocks int64) lockTable {
-	lt := &lockTableImpl{maxLocks: maxLocks}
-	for i := 0; i < len(lt.locks); i++ {
-		lt.locks[i].BTree = btree.New(16)
-	}
-	return lt
 }
 
 var _ lockTable = &lockTableImpl{}
@@ -209,12 +204,30 @@ var _ lockTable = &lockTableImpl{}
 //   lockTableGuard that returns false from StartWaiting()).
 type lockTableGuardImpl struct {
 	seqNum uint64
-	table  *lockTableImpl
 
 	// Information about this request.
 	txn   *enginepb.TxnMeta
 	spans *spanset.SpanSet
 	ts    hlc.Timestamp
+
+	// Snapshots of the trees for which this request has some spans. Note that
+	// the lockStates in these snapshots may have been removed from
+	// lockTableImpl. Additionally, it is possible that there is a new lockState
+	// for the same key. This can result in various harmless anomalies:
+	// - the request may hold a reservation on a lockState that is no longer
+	//   in the tree. When it next does a scan, it will either find a new
+	//   lockState where it will compete or none. Both lockStates can be in
+	//   the mu.locks map, which is harmless.
+	// - the request may wait behind a reservation holder that is not the
+	//   lock holder. This could cause a delay in pushing the lock holder.
+	//   This is not a correctness issue (the whole system is not deadlocked)
+	//   and we expect will not be a real performance issue.
+	//
+	// TODO(sbhola): experimentally evaluate the lazy queueing of the current
+	// implementation, in comparison with eager queueing. If eager queueing
+	// is comparable in system throughput, one can eliminate the above anomalies.
+	//
+	tableSnapshot [spanset.NumSpanScope]btree
 
 	// A request whose startWait is set to true in ScanAndEnqueue is actively
 	// waiting at a particular key. This is the first key encountered when
@@ -231,7 +244,7 @@ type lockTableGuardImpl struct {
 	// The key for the lockState is contained in the Span specified by
 	// spans[sa][ss][index].
 	ss    spanset.SpanScope
-	sa    spanset.SpanAccess
+	sa    spanset.SpanAccess // Iterates from stronger to weaker strength
 	index int
 
 	mu struct {
@@ -241,8 +254,8 @@ type lockTableGuardImpl struct {
 		state  waitingState
 		signal chan struct{}
 
-		// locks for which this request has a reservation or is in the queue or
-		// actively waiting as a reader.
+		// locks for which this request has a reservation or is in the queue of
+		// writers (active or inactive) or actively waiting as a reader.
 		//
 		// TODO(sbhola): investigate whether the logic to maintain this locks map
 		// can be simplified so it doesn't need to be adjusted by various
@@ -292,7 +305,7 @@ func (g *lockTableGuardImpl) CurState() waitingState {
 	// mustFindNextLockAfter to true while this method executes.
 	g.mu.mustFindNextLockAfter = false
 	g.mu.Unlock()
-	g.table.findNextLockAfter(g, false /* notify */)
+	g.findNextLockAfter(false /* notify */)
 	g.mu.Lock() // Unlock deferred
 	return g.mu.state
 }
@@ -320,6 +333,60 @@ func (g *lockTableGuardImpl) doneWaitingAtLock(hasReservation bool, l *lockState
 
 func (g *lockTableGuardImpl) isTxn(txn *enginepb.TxnMeta) bool {
 	return g.txn != nil && g.txn.ID == txn.ID
+}
+
+// Finds the next lock, after the current one, to actively wait at. If it
+// finds the next lock the request starts actively waiting there, else it is
+// told that it is done waiting.
+// Acquires g.mu.
+func (g *lockTableGuardImpl) findNextLockAfter(notify bool) {
+	spans := g.spans.GetSpans(g.sa, g.ss)
+	var span *spanset.Span
+	resumingInSameSpan := false
+	if g.index == -1 || len(spans[g.index].EndKey) == 0 {
+		span = stepToNextSpan(g)
+	} else {
+		span = &spans[g.index]
+		resumingInSameSpan = true
+	}
+	for span != nil {
+		startKey := span.Key
+		if resumingInSameSpan {
+			startKey = g.key
+		}
+		tree := g.tableSnapshot[g.ss]
+		iter := tree.MakeIter()
+
+		// From here on, the use of resumingInSameSpan is just a performance
+		// optimization to deal with the interface limitation of btree that
+		// prevents us from specifying an exclusive start key. We need to check
+		// that the lock is not the same as our exclusive start key and only need
+		// to do that check once -- for the first lock.
+		ltRange := &lockState{key: startKey, endKey: span.EndKey}
+		for iter.FirstOverlap(ltRange); iter.Valid(); iter.NextOverlap(ltRange) {
+			l := iter.Cur()
+			if resumingInSameSpan {
+				resumingInSameSpan = false
+				if l.key.Equal(startKey) {
+					// This lock is where it stopped waiting.
+					continue
+				}
+				// Else, past the lock where it stopped waiting. We may not
+				// encounter that lock since it may have been garbage collected.
+			}
+			if l.tryActiveWait(g, g.sa, notify) {
+				return
+			}
+		}
+		resumingInSameSpan = false
+		span = stepToNextSpan(g)
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.mu.state.stateKind = doneWaiting
+	if notify {
+		g.notify()
+	}
 }
 
 // Waiting writers in a lockState are wrapped in a queuedGuard. A waiting
@@ -354,6 +421,9 @@ type lockHolderInfo struct {
 
 // Per lock state in lockTableImpl.
 type lockState struct {
+	id     uint64 // needed for implementing util/interval/generic type contract
+	endKey []byte // used in btree iteration and tests
+
 	// The key being locked and the scope of that key. This state is never
 	// mutated.
 	key roachpb.Key
@@ -483,19 +553,29 @@ type lockWaitQueue struct {
 	// - Holders: only shared locks are compatible with themselves, so there can
 	//   be one of (a) no holder (b) multiple shared lock holders, (c) one
 	//   exclusive holder, (d) one upgrade holder. Non-locking reads will
-	//   continue to wait in waitingReaders for only an incompatible exclusive
-	//   holder.
+	//   wait in waitingReaders for only an incompatible exclusive holder.
 	//
 	// - Reservers: This follows the same pattern as holders. Non-locking reads
 	//   do not wait on reservers.
 	//
-	// - Queueing and dependencies: All potential lockers will wait in the same
-	//   queue. A sequence of consecutive requests that have the potential to
-	//   acquire a shared lock will jointly reserve that shared lock. Such
-	//   requests cannot jump ahead of requests with a lower seqnum just because
-	//   there is currently a shared lock reservation (this can cause lockTable
-	//   induced deadlocks). Such joint reservations can be partially broken by
-	//   a waiter desiring an exclusive or upgrade lock.
+	// - Queueing and dependencies: All potential lockers and non-transactional
+	//   writers will wait in the same queue. A sequence of consecutive requests
+	//   that have the potential to acquire a shared lock will jointly reserve
+	//   that shared lock. Such requests cannot jump ahead of requests with a
+	//   lower seqnum just because there is currently a shared lock reservation
+	//   (this can cause lockTable induced deadlocks). Such joint reservations
+	//   can be partially broken by a waiter desiring an exclusive or upgrade
+	//   lock. Like the current code, non-transactional writes will wait for
+	//   reservations that have a lower sequence num, but not make their own
+	//   reservation. Additionally, they can partially break joint reservations.
+	//
+	//   Reservations that are (partially or fully) broken cause requests to
+	//   reenter the queue as inactive waiters. This is no different than the
+	//   current behavior. Each request can specify the same key in spans for
+	//   ReadOnly, ReadShared, ReadUpgrade, ReadWrite. The spans will be
+	//   iterated over in decreasing order of strength, to only wait at a lock
+	//   at the highest strength (this is similar to the current behavior using
+	//   accessDecreasingStrength).
 	//
 	//   For dependencies, a waiter desiring an exclusive or upgrade lock always
 	//   conflicts with the holder(s) or reserver(s) so that is the dependency
@@ -541,10 +621,17 @@ type lockWaitQueue struct {
 	distinguishedWaiter *lockTableGuardImpl
 }
 
-// Less implements the btree.Item interface.
-func (l *lockState) Less(i btree.Item) bool {
-	return l.key.Compare(i.(*lockState).key) < 0
-}
+//go:generate ../../util/interval/generic/gen.sh *lockState concurrency
+
+// Methods required by util/interval/generic type contract.
+func (l *lockState) ID() uint64         { return l.id }
+func (l *lockState) Key() []byte        { return l.key }
+func (l *lockState) EndKey() []byte     { return l.endKey }
+func (l *lockState) String() string     { return string(l.key) }
+func (l *lockState) New() *lockState    { return new(lockState) }
+func (l *lockState) SetID(v uint64)     { l.id = v }
+func (l *lockState) SetKey(v []byte)    { l.key = v }
+func (l *lockState) SetEndKey(v []byte) { l.endKey = v }
 
 // Called for a write request when there is a reservation. Returns true iff it
 // succeeds.
@@ -567,7 +654,7 @@ func (l *lockState) tryBreakReservation(seqNum uint64) bool {
 // waitForDistinguished states.
 // REQUIRES: l.mu is locked.
 func (l *lockState) informActiveWaiters() {
-	waitForTxn, waitForTs := l.getLockerInfo()
+	waitForTxn, waitForTs, waitForDur := l.getLockerInfo()
 	var checkForWaitSelf bool
 	findDistinguished := l.distinguishedWaiter == nil
 	if waitForTxn == nil {
@@ -583,6 +670,7 @@ func (l *lockState) informActiveWaiters() {
 		stateKind: waitFor,
 		txn:       waitForTxn,
 		ts:        waitForTs,
+		dur:       waitForDur,
 		key:       l.key,
 		held:      l.holder.locked,
 		access:    spanset.SpanReadWrite,
@@ -681,9 +769,9 @@ func (l *lockState) isLockedBy(id uuid.UUID) bool {
 // Returns information about the current lock holder if the lock is held, else
 // returns nil.
 // REQUIRES: l.mu is locked.
-func (l *lockState) getLockerInfo() (*enginepb.TxnMeta, hlc.Timestamp) {
+func (l *lockState) getLockerInfo() (*enginepb.TxnMeta, hlc.Timestamp, lock.Durability) {
 	if !l.holder.locked {
-		return nil, hlc.Timestamp{}
+		return nil, hlc.Timestamp{}, 0
 	}
 
 	// If the lock is held as both replicated and unreplicated we want to
@@ -700,7 +788,7 @@ func (l *lockState) getLockerInfo() (*enginepb.TxnMeta, hlc.Timestamp) {
 		l.holder.holder[lock.Unreplicated].ts.Less(l.holder.holder[lock.Replicated].ts)) {
 		index = lock.Unreplicated
 	}
-	return l.holder.holder[index].txn, l.holder.holder[index].ts
+	return l.holder.holder[index].txn, l.holder.holder[index].ts, index
 }
 
 // Decides whether the request g with access sa should actively wait at this
@@ -722,7 +810,7 @@ func (l *lockState) tryActiveWait(g *lockTableGuardImpl, sa spanset.SpanAccess, 
 	}
 
 	// Lock is not empty.
-	waitForTxn, waitForTs := l.getLockerInfo()
+	waitForTxn, waitForTs, waitForDur := l.getLockerInfo()
 	if waitForTxn != nil && g.isTxn(waitForTxn) {
 		// Already locked by this txn.
 		return false
@@ -755,6 +843,25 @@ func (l *lockState) tryActiveWait(g *lockTableGuardImpl, sa spanset.SpanAccess, 
 		}
 		// Locked by some other txn.
 		if g.ts.Less(waitForTs) {
+			return false
+		}
+		g.mu.Lock()
+		_, alsoHasStrongerAccess := g.mu.locks[l]
+		g.mu.Unlock()
+
+		// If the request already has this lock in its locks map, it must also be
+		// writing to this key and must be either a reservation holder or inactive
+		// waiter at this lock. The former has already been handled above. For the
+		// latter, it must have had its reservation broken. Since this is a weaker
+		// access we defer to the stronger access and don't wait here.
+		//
+		// For non-transactional requests that have the key specified as both
+		// SpanReadOnly and SpanReadWrite, the request never acquires a
+		// reservation, so using the locks map to detect this duplication of the
+		// key is not possible. In the rare case, the lock is now held at a
+		// timestamp that is not compatible with this request and it will wait
+		// here -- there is no correctness issue with doing that.
+		if alsoHasStrongerAccess {
 			return false
 		}
 	}
@@ -836,6 +943,7 @@ func (l *lockState) tryActiveWait(g *lockTableGuardImpl, sa spanset.SpanAccess, 
 			stateKind:   stateType,
 			txn:         waitForTxn,
 			ts:          waitForTs,
+			dur:         waitForDur,
 			key:         l.key,
 			held:        l.holder.locked,
 			access:      spanset.SpanReadWrite,
@@ -859,32 +967,33 @@ func (l *lockState) acquireLock(
 	defer l.mu.Unlock()
 	if l.holder.locked {
 		// Already held.
-		beforeTxn, beforeTs := l.getLockerInfo()
+		beforeTxn, beforeTs, _ := l.getLockerInfo()
 		if txn.ID != beforeTxn.ID {
-			return errors.Errorf("caller violated contract")
+			return errors.Errorf("existing lock cannot be acquired by different transaction")
 		}
 		if l.holder.holder[durability].txn != nil && l.holder.holder[durability].txn.Epoch < txn.Epoch {
 			// Clear the sequences for the older epoch.
 			l.holder.holder[durability].seqs = l.holder.holder[durability].seqs[:0]
 		}
 		seqs := l.holder.holder[durability].seqs
-		add := true
-		if len(seqs) > 0 {
-			lastSeq := seqs[len(seqs)-1]
-			if lastSeq > txn.Sequence {
-				return errors.Errorf("caller violated contract")
+		if len(seqs) > 0 && seqs[len(seqs)-1] >= txn.Sequence {
+			// Idempotent lock acquisition. In this case, we simply ignore
+			// the lock acquisition as long as it corresponds to an existing
+			// sequence number. The validity of such a lock re-acquisition
+			// should have already been determined at the MVCC level.
+			if i := sort.Search(len(seqs), func(i int) bool {
+				return seqs[i] >= txn.Sequence
+			}); i == len(seqs) {
+				panic("lockTable bug - search value <= last element")
+			} else if seqs[i] != txn.Sequence {
+				return errors.Errorf("missing lock at sequence: %v not in %v", txn.Sequence, seqs)
 			}
-			if lastSeq == txn.Sequence {
-				// Idempotent lock acquisition.
-				add = false
-			}
-		}
-		if add {
-			l.holder.holder[durability].seqs = append(seqs, txn.Sequence)
+			return nil
 		}
 		l.holder.holder[durability].txn = txn
 		l.holder.holder[durability].ts = ts
-		_, afterTs := l.getLockerInfo()
+		l.holder.holder[durability].seqs = append(l.holder.holder[durability].seqs, txn.Sequence)
+		_, afterTs, _ := l.getLockerInfo()
 		if afterTs.Less(beforeTs) {
 			return errors.Errorf("caller violated contract")
 		} else if beforeTs.Less(afterTs) {
@@ -896,10 +1005,6 @@ func (l *lockState) acquireLock(
 	// possibility that some other request has broken this reservation because
 	// of a concurrent release but that is harmless since this request is
 	// holding latches and has proceeded to evaluation.
-	//
-	// TODO(sbhola): remove this possibility of an acquire encountering a
-	// reservation by a different request when the code switched over to the
-	// copy-on-write btree.
 	brokeReservation := false
 	if l.reservation != nil {
 		if l.reservation.txn.ID != txn.ID {
@@ -950,9 +1055,13 @@ func (l *lockState) acquireLock(
 						panic("lockTable bug")
 					}
 				}
+				g.doneWaitingAtLock(false, l)
+			} else {
+				g.mu.Lock()
+				delete(g.mu.locks, l)
+				g.mu.Unlock()
 			}
 			l.queuedWriters.Remove(curr)
-			g.doneWaitingAtLock(false, l)
 		}
 	}
 
@@ -986,13 +1095,6 @@ func (l *lockState) discoveredLock(
 		l.holder.holder[lock.Replicated].ts = ts
 	}
 
-	g.mu.Lock()
-	_, presentHere := g.mu.locks[l]
-	if !presentHere {
-		g.mu.locks[l] = struct{}{}
-	}
-	g.mu.Unlock()
-
 	// Queue the existing reservation holder. Note that this reservation
 	// holder may not be equal to g due to two reasons (a) the reservation
 	// of g could have been broken even though g is holding latches (see
@@ -1012,7 +1114,16 @@ func (l *lockState) discoveredLock(
 		informWaiters = false
 	}
 
-	if !presentHere && sa == spanset.SpanReadWrite {
+	g.mu.Lock()
+	_, presentHere := g.mu.locks[l]
+	addToQueue := !presentHere && sa == spanset.SpanReadWrite
+	if addToQueue {
+		// Since g will place itself in queue as inactive waiter below.
+		g.mu.locks[l] = struct{}{}
+	}
+	g.mu.Unlock()
+
+	if addToQueue {
 		// Put self in queue as inactive waiter.
 		qg := &queuedGuard{
 			guard:  g,
@@ -1041,11 +1152,11 @@ func (l *lockState) discoveredLock(
 }
 
 // Acquires l.mu.
-func (l *lockState) tryClearLock() bool {
+func (l *lockState) tryClearLock(force bool) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	replicatedHeld := l.holder.locked && l.holder.holder[lock.Replicated].txn != nil
-	if replicatedHeld && l.distinguishedWaiter == nil {
+	if replicatedHeld && l.distinguishedWaiter == nil && !force {
 		// Replicated lock is held and has no distinguished waiter.
 		return false
 	}
@@ -1053,14 +1164,15 @@ func (l *lockState) tryClearLock() bool {
 	// Remove unreplicated holder.
 	l.holder.holder[lock.Unreplicated] = lockHolderInfo{}
 	var waitState waitingState
-	if replicatedHeld {
-		holderTxn, holderTs := l.getLockerInfo()
+	if replicatedHeld && !force {
+		holderTxn, holderTs, holderDur := l.getLockerInfo()
 		// Note that none of the current waiters can be requests
 		// from holderTxn.
 		waitState = waitingState{
 			stateKind:   waitElsewhere,
 			txn:         holderTxn,
 			ts:          holderTs,
+			dur:         holderDur,
 			key:         l.key,
 			held:        true,
 			access:      spanset.SpanReadWrite,
@@ -1147,13 +1259,13 @@ func removeIgnored(
 // transaction, else the lock is updated. Returns whether the lockState can be
 // garbage collected.
 // Acquires l.mu.
-func (l *lockState) tryUpdateLock(intent *roachpb.Intent) (gc bool, err error) {
+func (l *lockState) tryUpdateLock(up *roachpb.LockUpdate) (gc bool, err error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if !l.isLockedBy(intent.Txn.ID) {
+	if !l.isLockedBy(up.Txn.ID) {
 		return false, nil
 	}
-	if intent.Status.IsFinalized() {
+	if up.Status.IsFinalized() {
 		l.holder.locked = false
 		for i := range l.holder.holder {
 			l.holder.holder[i] = lockHolderInfo{}
@@ -1162,9 +1274,9 @@ func (l *lockState) tryUpdateLock(intent *roachpb.Intent) (gc bool, err error) {
 		return gc, nil
 	}
 
-	ts := intent.Txn.WriteTimestamp
-	txn := &intent.Txn
-	_, beforeTs := l.getLockerInfo()
+	ts := up.Txn.WriteTimestamp
+	txn := &up.Txn
+	_, beforeTs, _ := l.getLockerInfo()
 	isLocked := false
 	for i := range l.holder.holder {
 		holderTxn := l.holder.holder[i].txn
@@ -1177,7 +1289,7 @@ func (l *lockState) tryUpdateLock(intent *roachpb.Intent) (gc bool, err error) {
 			continue
 		}
 		// Held in same epoch.
-		l.holder.holder[i].seqs = removeIgnored(l.holder.holder[i].seqs, intent.IgnoredSeqNums)
+		l.holder.holder[i].seqs = removeIgnored(l.holder.holder[i].seqs, up.IgnoredSeqNums)
 		if len(l.holder.holder[i].seqs) == 0 {
 			l.holder.holder[i].txn = nil
 			continue
@@ -1210,7 +1322,7 @@ func (l *lockState) increasedLockTs(newTs hlc.Timestamp) {
 		g := e.Value.(*lockTableGuardImpl)
 		curr := e
 		e = e.Next()
-		if !g.ts.LessEq(newTs) {
+		if g.ts.Less(newTs) {
 			// Stop waiting.
 			l.waitingReaders.Remove(curr)
 			if g == l.distinguishedWaiter {
@@ -1354,9 +1466,9 @@ func (t *lockTableImpl) ScanAndEnqueue(req Request, guard lockTableGuard) lockTa
 		seqNum := atomic.AddUint64(&t.seqNum, 1)
 		g = &lockTableGuardImpl{
 			seqNum: seqNum,
-			table:  t,
 			spans:  req.Spans,
 			ts:     req.Timestamp,
+			sa:     spanset.NumSpanAccess - 1,
 			index:  -1,
 		}
 		if req.Txn != nil {
@@ -1366,16 +1478,31 @@ func (t *lockTableImpl) ScanAndEnqueue(req Request, guard lockTableGuard) lockTa
 		g.mu.locks = make(map[*lockState]struct{})
 	} else {
 		g = guard.(*lockTableGuardImpl)
-		g.mu.Lock()
 		g.key = nil
-		g.sa = spanset.SpanAccess(0)
+		g.sa = spanset.NumSpanAccess - 1
 		g.ss = spanset.SpanScope(0)
 		g.index = -1
+		g.mu.Lock()
 		g.mu.startWait = false
 		g.mu.mustFindNextLockAfter = false
 		g.mu.Unlock()
 	}
-	t.findNextLockAfter(g, true /* notify */)
+	for ss := spanset.SpanScope(0); ss < spanset.NumSpanScope; ss++ {
+		for sa := spanset.SpanAccess(0); sa < spanset.NumSpanAccess; sa++ {
+			if len(g.spans.GetSpans(sa, ss)) > 0 {
+				// Since the spans are constant for a request, every call to
+				// ScanAndEnqueue for that request will execute the following code
+				// for the same SpanScope(s). Any SpanScope for which this code does
+				// not execute will always have an empty snapshot.
+				t.locks[ss].mu.RLock()
+				g.tableSnapshot[ss].Reset()
+				g.tableSnapshot[ss] = t.locks[ss].Clone()
+				t.locks[ss].mu.RUnlock()
+				break
+			}
+		}
+	}
+	g.findNextLockAfter(true /* notify */)
 	return g
 }
 
@@ -1418,19 +1545,19 @@ func (t *lockTableImpl) AddDiscoveredLock(intent *roachpb.Intent, guard lockTabl
 	tree := &t.locks[ss]
 	tree.mu.Lock()
 	// Can't release tree.mu until call l.discoveredLock() since someone may
-	// find an empty lock and remove it from the tree. If we expect that
-	// lockState will already be in tree we can optimize this by first trying
-	// with a tree.mu.RLock().
+	// find an empty lock and remove it from the tree.
 	defer tree.mu.Unlock()
-	i := tree.Get(&lockState{key: key})
-	if i == nil {
-		l = &lockState{key: key, ss: ss}
+	iter := tree.MakeIter()
+	iter.FirstOverlap(&lockState{key: key})
+	if !iter.Valid() {
+		l = &lockState{id: tree.lockIDSeqNum, key: key, ss: ss}
+		tree.lockIDSeqNum++
 		l.queuedWriters.Init()
 		l.waitingReaders.Init()
-		tree.ReplaceOrInsert(l)
+		tree.Set(l)
 		atomic.AddInt64(&tree.numLocks, 1)
 	} else {
-		l = i.(*lockState)
+		l = iter.Cur()
 	}
 	return l.discoveredLock(&intent.Txn, intent.Txn.WriteTimestamp, g, sa)
 }
@@ -1453,20 +1580,22 @@ func (t *lockTableImpl) AcquireLock(
 	// an empty lock and remove it from the tree. If we expect that lockState
 	// will already be in tree we can optimize this by first trying with a
 	// tree.mu.RLock().
-	i := tree.Get(&lockState{key: key})
-	if i == nil {
+	iter := tree.MakeIter()
+	iter.FirstOverlap(&lockState{key: key})
+	if !iter.Valid() {
 		if durability == lock.Replicated {
 			tree.mu.Unlock()
 			// Don't remember uncontended replicated locks.
 			return nil
 		}
-		l = &lockState{key: key, ss: ss}
+		l = &lockState{id: tree.lockIDSeqNum, key: key, ss: ss}
+		tree.lockIDSeqNum++
 		l.queuedWriters.Init()
 		l.waitingReaders.Init()
-		tree.ReplaceOrInsert(l)
+		tree.Set(l)
 		atomic.AddInt64(&tree.numLocks, 1)
 	} else {
-		l = i.(*lockState)
+		l = iter.Cur()
 	}
 	err := l.acquireLock(strength, durability, txn, txn.WriteTimestamp)
 	tree.mu.Unlock()
@@ -1476,50 +1605,60 @@ func (t *lockTableImpl) AcquireLock(
 		totalLocks += atomic.LoadInt64(&t.locks[i].numLocks)
 	}
 	if totalLocks > t.maxLocks {
-		t.clearMostLocks()
+		t.tryClearLocks(false /* force */)
 	}
 	return err
 }
 
-// Removes all locks, except for those that are held with replicated
-// durability and have no distinguished waiter, and tells those waiters to
-// wait elsewhere or that they are done waiting. A replicated lock which has
-// been discovered by a request but no request is actively waiting on it will
-// be preserved since we need to tell that request who it is waiting for when
-// it next calls ScanAndEnqueue(). If we aggressively removed even these
+// If force is false, removes all locks, except for those that are held with
+// replicated durability and have no distinguished waiter, and tells those
+// waiters to wait elsewhere or that they are done waiting. A replicated lock
+// which has been discovered by a request but no request is actively waiting on
+// it will be preserved since we need to tell that request who it is waiting for
+// when it next calls ScanAndEnqueue(). If we aggressively removed even these
 // locks, the next ScanAndEnqueue() would not find the lock, the request would
-// evaluate again, again discover that lock and if clearMostLocks() keeps
-// getting called would be stuck in this loop without pushing.
-func (t *lockTableImpl) clearMostLocks() {
+// evaluate again, again discover that lock and if tryClearLocks() keeps getting
+// called would be stuck in this loop without pushing.
+//
+// If force is true, removes all locks and marks all guards as doneWaiting.
+func (t *lockTableImpl) tryClearLocks(force bool) {
 	for i := 0; i < int(spanset.NumSpanScope); i++ {
 		tree := &t.locks[i]
 		tree.mu.Lock()
 		var locksToClear []*lockState
-		tree.Ascend(func(it btree.Item) bool {
-			l := it.(*lockState)
-			if l.tryClearLock() {
+		iter := tree.MakeIter()
+		for iter.First(); iter.Valid(); iter.Next() {
+			l := iter.Cur()
+			if l.tryClearLock(force) {
 				locksToClear = append(locksToClear, l)
 			}
-			return true
-		})
+		}
 		atomic.AddInt64(&tree.numLocks, int64(-len(locksToClear)))
-		for _, l := range locksToClear {
-			tree.Delete(l)
+		if tree.Len() == len(locksToClear) {
+			// Fast-path full clear.
+			tree.Reset()
+		} else {
+			for _, l := range locksToClear {
+				tree.Delete(l)
+			}
 		}
 		tree.mu.Unlock()
 	}
 }
 
+// Given the key with scope ss must be in spans, returns the strongest access
+// specified in the spans.
 func findAccessInSpans(
 	key roachpb.Key, ss spanset.SpanScope, spans *spanset.SpanSet,
 ) (spanset.SpanAccess, error) {
-	for sa := spanset.SpanAccess(0); sa < spanset.NumSpanAccess; sa++ {
+	for sa := spanset.NumSpanAccess - 1; sa >= 0; sa-- {
 		s := spans.GetSpans(sa, ss)
 		// First span that starts after key
 		i := sort.Search(len(s), func(i int) bool {
 			return key.Compare(s[i].Key) < 0
 		})
-		if i > 0 && ((len(s[i-1].EndKey) > 0 && key.Compare(s[i-1].EndKey) < 0) || key.Equal(s[i-1].Key)) {
+		if i > 0 &&
+			((len(s[i-1].EndKey) > 0 && key.Compare(s[i-1].EndKey) < 0) || key.Equal(s[i-1].Key)) {
 			return sa, nil
 		}
 	}
@@ -1530,17 +1669,17 @@ func findAccessInSpans(
 func (t *lockTableImpl) tryGCLocks(tree *treeMu, locks []*lockState) {
 	tree.mu.Lock()
 	defer tree.mu.Unlock()
+	iter := tree.MakeIter()
 	for _, l := range locks {
-		i := tree.Get(l)
+		iter.FirstOverlap(l)
 		// Since the same lockState can go from non-empty to empty multiple times
 		// it is possible that multiple threads are racing to delete it and
 		// multiple find it empty and one wins. If a concurrent thread made the
-		// lockState non-empty, or if it added a different lockState for the same
-		// key we do not want to delete it accidentally if it is non-empty.
-		if i == nil {
+		// lockState non-empty we do not want to delete it accidentally.
+		if !iter.Valid() {
 			continue
 		}
-		l = i.(*lockState)
+		l = iter.Cur()
 		l.mu.Lock()
 		empty := l.isEmptyLock()
 		l.mu.Unlock()
@@ -1552,8 +1691,8 @@ func (t *lockTableImpl) tryGCLocks(tree *treeMu, locks []*lockState) {
 }
 
 // UpdateLocks implements the lockTable interface.
-func (t *lockTableImpl) UpdateLocks(intent *roachpb.Intent) error {
-	span := intent.Span
+func (t *lockTableImpl) UpdateLocks(up *roachpb.LockUpdate) error {
+	span := up.Span
 	ss := spanset.SpanGlobal
 	if keys.IsLocal(span.Key) {
 		ss = spanset.SpanLocal
@@ -1561,24 +1700,24 @@ func (t *lockTableImpl) UpdateLocks(intent *roachpb.Intent) error {
 	tree := &t.locks[ss]
 	var err error
 	var locksToGC []*lockState
-	changeFunc := func(i btree.Item) bool {
-		l := i.(*lockState)
-		gc, err2 := l.tryUpdateLock(intent)
+	changeFunc := func(l *lockState) {
+		gc, err2 := l.tryUpdateLock(up)
 		if err2 != nil {
 			err = err2
-			return false
+			return
 		}
 		if gc {
 			locksToGC = append(locksToGC, l)
 		}
-		return true
 	}
 	tree.mu.RLock()
-	if len(span.EndKey) > 0 {
-		tree.AscendRange(&lockState{key: span.Key}, &lockState{key: span.EndKey}, changeFunc)
-	} else {
-		if i := tree.Get(&lockState{key: span.Key}); i != nil {
-			changeFunc(i)
+	iter := tree.MakeIter()
+	ltRange := &lockState{key: span.Key, endKey: span.EndKey}
+	for iter.FirstOverlap(ltRange); iter.Valid(); iter.NextOverlap(ltRange) {
+		changeFunc(iter.Cur())
+		// Optimization to avoid a second key comparison (not for correctness).
+		if len(span.EndKey) == 0 {
+			break
 		}
 	}
 	tree.mu.RUnlock()
@@ -1595,7 +1734,7 @@ func (t *lockTableImpl) UpdateLocks(intent *roachpb.Intent) error {
 func stepToNextSpan(g *lockTableGuardImpl) *spanset.Span {
 	g.index++
 	for ; g.ss < spanset.NumSpanScope; g.ss++ {
-		for ; g.sa < spanset.NumSpanAccess; g.sa++ {
+		for ; g.sa >= 0; g.sa-- {
 			spans := g.spans.GetSpans(g.sa, g.ss)
 			if g.index < len(spans) {
 				span := &spans[g.index]
@@ -1604,88 +1743,13 @@ func stepToNextSpan(g *lockTableGuardImpl) *spanset.Span {
 			}
 			g.index = 0
 		}
-		g.sa = 0
+		g.sa = spanset.NumSpanAccess - 1
 	}
 	return nil
 }
 
-// Finds the next lock, after the current one, to actively wait at. If it
-// finds the next lock the request starts actively waiting there, else it is
-// told that it is done waiting.
-// Acquires g.mu. Acquires treeMu.mu's in read mode.
-func (t *lockTableImpl) findNextLockAfter(g *lockTableGuardImpl, notify bool) {
-	spans := g.spans.GetSpans(g.sa, g.ss)
-	var span *spanset.Span
-	resumingInSameSpan := false
-	if g.index == -1 || len(spans[g.index].EndKey) == 0 {
-		span = stepToNextSpan(g)
-	} else {
-		span = &spans[g.index]
-		resumingInSameSpan = true
-	}
-	for span != nil {
-		tree := &t.locks[g.ss]
-		sa := g.sa
-		if len(span.EndKey) == 0 {
-			// NB: !resumingInSameSpan
-			tree.mu.RLock()
-			i := tree.Get(&lockState{key: span.Key})
-			// We don't need to hold tree.mu while calling tryActiveWait().
-			tree.mu.RUnlock()
-			if i != nil {
-				l := i.(*lockState)
-				if l.tryActiveWait(g, sa, notify) {
-					return
-				}
-			}
-		} else {
-			startKey := span.Key
-			if resumingInSameSpan {
-				startKey = g.key
-			}
-			waiting := false
-			tree.mu.RLock()
-			// From here on, the use of resumingInSameSpan is just a performance
-			// optimization to deal with the interface limitation of AscendRange()
-			// that prevents us from specifying an exclusive start key. We need to
-			// check that the lock is not the same as our exclusive start key and
-			// only need to do that check once -- for the first lock.
-			//
-			// We will hold tree.mu in read mode while calling tryActiveWait() --
-			// this is harmless.
-			tree.AscendRange(&lockState{key: startKey}, &lockState{key: span.EndKey},
-				func(i btree.Item) bool {
-					l := i.(*lockState)
-					if resumingInSameSpan {
-						resumingInSameSpan = false
-						if l.key.Equal(startKey) {
-							// This lock is where it stopped waiting.
-							return true
-						}
-						// Else, past the lock where it stopped waiting. We may not
-						// encounter that lock since it may have been garbage collected.
-					}
-					waiting = l.tryActiveWait(g, sa, notify)
-					return !waiting
-				})
-			resumingInSameSpan = false
-			tree.mu.RUnlock()
-			if waiting {
-				return
-			}
-		}
-		span = stepToNextSpan(g)
-	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.mu.state.stateKind = doneWaiting
-	if notify {
-		g.notify()
-	}
-}
-
 func (t *lockTableImpl) Clear() {
-	// TODO(nvanbenschoten): implement and test this.
+	t.tryClearLocks(true /* force */)
 }
 
 // For tests.
@@ -1694,7 +1758,11 @@ func (t *lockTableImpl) String() string {
 	waitingOnStr := func(txn *enginepb.TxnMeta, ts hlc.Timestamp) string {
 		// TODO(sbhola): strip the leading 0 bytes from the UUID string since tests are assigning
 		// UUIDs using a counter and makes this output more readable.
-		return fmt.Sprintf("txn: %v, ts: %v", txn.ID, ts)
+		var seqStr string
+		if txn.Sequence != 0 {
+			seqStr = fmt.Sprintf(", seq: %v", txn.Sequence)
+		}
+		return fmt.Sprintf("txn: %v, ts: %v%s", txn.ID, ts, seqStr)
 	}
 	lockStateStrings := func(l *lockState) {
 		l.mu.Lock()
@@ -1703,7 +1771,7 @@ func (t *lockTableImpl) String() string {
 			fmt.Fprintln(&buf, "empty")
 			return
 		}
-		txn, ts := l.getLockerInfo()
+		txn, ts, _ := l.getLockerInfo()
 		if txn == nil {
 			fmt.Fprintf(&buf, "  res: req: %d, %s\n",
 				l.reservation.seqNum, waitingOnStr(l.reservation.txn, l.reservation.ts))
@@ -1743,12 +1811,12 @@ func (t *lockTableImpl) String() string {
 		scope := spanset.SpanScope(i).String()
 		tree.mu.RLock()
 		fmt.Fprintf(&buf, "%s: num=%d\n", scope, atomic.LoadInt64(&tree.numLocks))
-		tree.Ascend(func(i btree.Item) bool {
-			l := i.(*lockState)
+		iter := tree.MakeIter()
+		for iter.First(); iter.Valid(); iter.Next() {
+			l := iter.Cur()
 			fmt.Fprintf(&buf, " lock: %s\n", l.key)
 			lockStateStrings(l)
-			return true
-		})
+		}
 		tree.mu.RUnlock()
 	}
 	return buf.String()

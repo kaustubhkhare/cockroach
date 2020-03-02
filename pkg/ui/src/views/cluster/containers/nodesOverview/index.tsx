@@ -31,6 +31,8 @@ import { INodeStatus, MetricConstants } from "src/util/proto";
 import { ColumnsConfig, Table, Text, TextTypes, Tooltip } from "src/components";
 import { Percentage } from "src/util/format";
 import { FixLong } from "src/util/fixLong";
+import { getNodeLocalityTiers } from "src/util/localities";
+import { LocalityTier } from "src/redux/localities";
 
 import TableSection from "./tableSection";
 import "./nodes.styl";
@@ -58,7 +60,9 @@ enum AggregatedNodeStatus {
 export interface NodeStatusRow {
   key: string;
   nodeId?: number;
-  region: string;
+  nodeName?: string;
+  region?: string;
+  tiers?: LocalityTier[];
   nodesCount?: number;
   uptime?: string;
   replicas: number;
@@ -66,6 +70,7 @@ export interface NodeStatusRow {
   availableCapacity: number;
   usedMemory: number;
   availableMemory: number;
+  numCpus: number;
   version?: string;
   /*
   * status is a union of Node statuses and two artificial statuses
@@ -80,7 +85,7 @@ export interface NodeStatusRow {
 interface DecommissionedNodeStatusRow {
   key: string;
   nodeId: number;
-  region: string;
+  nodeName: string;
   status: LivenessStatus;
   decommissionedDate: Moment;
 }
@@ -119,6 +124,37 @@ const getStatusDescription = (status: LivenessStatus) => {
   }
 };
 
+// tslint:disable-next-line:variable-name
+const NodeNameColumn: React.FC<{ record: NodeStatusRow | DecommissionedNodeStatusRow }> = ({ record }) => {
+  return (
+    <Link className="nodes-table__link" to={`/node/${record.nodeId}`}>
+      <Text textType={TextTypes.BodyStrong}>{`N${record.nodeId} `}</Text>
+      <Text>{record.nodeName}</Text>
+    </Link>
+  );
+};
+
+// tslint:disable-next-line:variable-name
+const NodeLocalityColumn: React.FC<{ record: NodeStatusRow }> = ({ record }) => {
+  return (
+    <Text>
+      <Tooltip
+        placement={"bottom"}
+        title={
+          <div>
+            {
+              record.tiers.map((tier, idx) =>
+                <div key={idx}>{`${tier.key} = ${tier.value}`}</div>)
+            }
+          </div>
+        }
+      >
+        {record.region}
+      </Tooltip>
+    </Text>
+  );
+};
+
 /**
  * LiveNodeList displays a sortable table of all "live" nodes, which includes
  * both healthy and suspect nodes. Included is a side-bar with summary
@@ -132,19 +168,9 @@ export class NodeList extends React.Component<LiveNodeListProps> {
       title: "nodes",
       render: (_text, record) => {
         if (!!record.nodeId) {
-          return (
-            <React.Fragment>
-              <Link className="nodes-table__link" to={`/node/${record.nodeId}`}>
-                <Text textType={TextTypes.BodyStrong}>{`N${record.nodeId} `}</Text>
-                <Text>{record.region}</Text>
-              </Link>
-            </React.Fragment>);
+          return <NodeNameColumn record={record} />;
         } else {
-          // Top level grouping item does not have nodeId
-          return (
-            <React.Fragment>
-              <Text>{record.region}</Text>
-            </React.Fragment>);
+          return <NodeLocalityColumn record={record} />;
         }
       },
       sorter: (a, b) => {
@@ -177,6 +203,7 @@ export class NodeList extends React.Component<LiveNodeListProps> {
       sorter: true,
       className: "column--align-right",
       width: "10%",
+      ellipsis: true,
     },
     {
       key: "replicas",
@@ -205,11 +232,19 @@ export class NodeList extends React.Component<LiveNodeListProps> {
       width: "10%",
     },
     {
+      key: "numCpus",
+      title: "cpus",
+      dataIndex: "numCpus",
+      sorter: true,
+      className: "column--align-right",
+      width: "8%",
+    },
+    {
       key: "version",
       dataIndex: "version",
       title: "version",
       sorter: true,
-      width: "10%",
+      width: "8%",
       ellipsis: true,
     },
     {
@@ -238,7 +273,7 @@ export class NodeList extends React.Component<LiveNodeListProps> {
       },
       title: "status",
       sorter: (a, b) => a.status - b.status,
-      width: "15%",
+      width: "13%",
     },
     {
       key: "logs",
@@ -283,11 +318,8 @@ class DecommissionedNodeList extends React.Component<DecommissionedNodeListProps
     {
       key: "nodes",
       title: "decommissioned nodes",
-      render: (_text, record) => (
-        <Link className="nodes-table__link" to={`/node/${record.nodeId}`}>
-          <Text textType={TextTypes.BodyStrong}>{`N${record.nodeId} `}</Text>
-          <Text>{record.region}</Text>
-        </Link>),
+      render: (_text, record) =>
+        <NodeNameColumn record={record}/>,
     },
     {
       key: "decommissionedSince",
@@ -334,11 +366,6 @@ class DecommissionedNodeList extends React.Component<DecommissionedNodeListProps
   }
 }
 
-const getNodeRegion = (nodeStatus: INodeStatus) => {
-  const region = nodeStatus.desc.locality?.tiers?.find(tier => tier.key === "region");
-  return region ? region.value : undefined;
-};
-
 export const liveNodesTableDataSelector = createSelector(
   partitionedStatuses,
   nodesSummarySelector,
@@ -356,34 +383,47 @@ export const liveNodesTableDataSelector = createSelector(
     // In case cluster is setup without localities:
     // - it represents a flat structure.
     const data = _.chain(liveStatuses)
-      .groupBy(getNodeRegion)
+      .groupBy((node: INodeStatus) => {
+        return node.desc.locality.tiers.map(tier => tier.value).join(".");
+      })
       .map((nodesPerRegion: INodeStatus[], regionKey: string): NodeStatusRow => {
         const nestedRows = nodesPerRegion.map((ns, idx): NodeStatusRow => {
           const { used: usedCapacity, usable: availableCapacity } = nodeCapacityStats(ns);
           return {
             key: `${regionKey}-${idx}`,
             nodeId: ns.desc.node_id,
-            region: getNodeRegion(ns),
+            nodeName: ns.desc.address.address_field,
             uptime: moment.duration(LongToMoment(ns.started_at).diff(moment())).humanize(),
             replicas: ns.metrics[MetricConstants.replicas],
             usedCapacity,
             availableCapacity,
             usedMemory: ns.metrics[MetricConstants.rss],
             availableMemory: FixLong(ns.total_system_memory).toNumber(),
+            numCpus: ns.num_cpus,
             version: ns.build_info.tag,
             status: nodesSummary.livenessStatusByNodeID[ns.desc.node_id] || LivenessStatus.LIVE,
           };
         });
 
+        // Grouped buckets with node statuses contain at least one element.
+        // The list of tires and lower level location are the same for every
+        // element in the group because grouping is made by string composed
+        // from location values.
+        const firstNodeInGroup = nodesPerRegion[0];
+        const tiers = getNodeLocalityTiers(firstNodeInGroup);
+        const lastTier = _.last(tiers);
+
         return {
           key: `${regionKey}`,
-          region: regionKey,
+          region: lastTier?.value,
+          tiers,
           nodesCount: nodesPerRegion.length,
           replicas: _.sum(nestedRows.map(nr => nr.replicas)),
           usedCapacity: _.sum(nestedRows.map(nr => nr.usedCapacity)),
           availableCapacity: _.sum(nestedRows.map(nr => nr.availableCapacity)),
           usedMemory: _.sum(nestedRows.map(nr => nr.usedMemory)),
           availableMemory: _.sum(nestedRows.map(nr => nr.availableMemory)),
+          numCpus: _.sum(nestedRows.map(nr => nr.numCpus)),
           status: nestedRows.every(nestedRow => nestedRow.status === LivenessStatus.LIVE) ?
             AggregatedNodeStatus.LIVE : AggregatedNodeStatus.WARNING,
           children: nestedRows,
@@ -417,7 +457,7 @@ export const decommissionedNodesTableDataSelector = createSelector(
         return {
           key: `${idx}`,
           nodeId: ns.desc.node_id,
-          region: getNodeRegion(ns),
+          nodeName: ns.desc.address.address_field,
           status: nodesSummary.livenessStatusByNodeID[ns.desc.node_id],
           decommissionedDate: getDecommissionedTime(ns.desc.node_id),
         };

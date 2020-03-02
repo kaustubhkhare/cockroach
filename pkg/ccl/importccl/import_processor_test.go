@@ -22,6 +22,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/blobs"
+	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -559,6 +560,7 @@ func queryJob(db sqlutils.DBHandle, jobID int64) (js jobState) {
 func queryJobUntil(
 	t *testing.T, db sqlutils.DBHandle, jobID int64, isDone func(js jobState) bool,
 ) (js jobState) {
+	t.Helper()
 	for r := retry.Start(base.DefaultRetryOptions()); r.Next(); {
 		js = queryJob(db, jobID)
 		if js.err != nil || isDone(js) {
@@ -582,6 +584,7 @@ func TestCSVImportCanBeResumed(t *testing.T) {
 	s, db, _ := serverutils.StartServer(t,
 		base.TestServerArgs{
 			Knobs: base.TestingKnobs{
+				RegistryLiveness: jobs.NewFakeNodeLiveness(1),
 				DistSQL: &execinfra.TestingKnobs{
 					BulkAdderFlushesEveryBatch: true,
 				},
@@ -599,15 +602,17 @@ func TestCSVImportCanBeResumed(t *testing.T) {
 	jobCtx, cancelImport := context.WithCancel(ctx)
 	jobIDCh := make(chan int64)
 	var jobID int64 = -1
-	var importSummary roachpb.BulkOpSummary
+	var importSummary backupccl.RowCount
 
 	registry.TestingResumerCreationKnobs = map[jobspb.Type]func(raw jobs.Resumer) jobs.Resumer{
 		// Arrange for our special job resumer to be
 		// returned the very first time we start the import.
 		jobspb.TypeImport: func(raw jobs.Resumer) jobs.Resumer {
+
 			resumer := raw.(*importResumer)
+			resumer.testingKnobs.ignoreProtectedTimestamps = true
 			resumer.testingKnobs.alwaysFlushJobProgress = true
-			resumer.testingKnobs.afterImport = func(summary roachpb.BulkOpSummary) error {
+			resumer.testingKnobs.afterImport = func(summary backupccl.RowCount) error {
 				importSummary = summary
 				return nil
 			}
@@ -677,7 +682,6 @@ func TestCSVImportCanBeResumed(t *testing.T) {
 
 func TestCSVImportMarksFilesFullyProcessed(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	t.Skip("")
 	const batchSize = 5
 	defer TestingSetCsvInputReaderBatchSize(batchSize)()
 	defer row.TestingSetDatumRowConverterBatchSize(2 * batchSize)()
@@ -686,6 +690,7 @@ func TestCSVImportMarksFilesFullyProcessed(t *testing.T) {
 	s, db, _ := serverutils.StartServer(t,
 		base.TestServerArgs{
 			Knobs: base.TestingKnobs{
+				RegistryLiveness: jobs.NewFakeNodeLiveness(1),
 				DistSQL: &execinfra.TestingKnobs{
 					BulkAdderFlushesEveryBatch: true,
 				},
@@ -704,7 +709,7 @@ func TestCSVImportMarksFilesFullyProcessed(t *testing.T) {
 	controllerBarrier, importBarrier := newSyncBarrier()
 
 	var jobID int64 = -1
-	var importSummary roachpb.BulkOpSummary
+	var importSummary backupccl.RowCount
 
 	registry.TestingResumerCreationKnobs = map[jobspb.Type]func(raw jobs.Resumer) jobs.Resumer{
 		// Arrange for our special job resumer to be
@@ -712,7 +717,8 @@ func TestCSVImportMarksFilesFullyProcessed(t *testing.T) {
 		jobspb.TypeImport: func(raw jobs.Resumer) jobs.Resumer {
 			resumer := raw.(*importResumer)
 			resumer.testingKnobs.alwaysFlushJobProgress = true
-			resumer.testingKnobs.afterImport = func(summary roachpb.BulkOpSummary) error {
+			resumer.testingKnobs.ignoreProtectedTimestamps = true
+			resumer.testingKnobs.afterImport = func(summary backupccl.RowCount) error {
 				importSummary = summary
 				return nil
 			}
@@ -798,7 +804,8 @@ func externalStorageFactory(
 	if err != nil {
 		return nil, err
 	}
-	return cloud.MakeExternalStorage(ctx, dest, nil, blobs.TestBlobServiceClient(workdir))
+	return cloud.MakeExternalStorage(ctx, dest, base.ExternalIOConfig{},
+		nil, blobs.TestBlobServiceClient(workdir))
 }
 
 // Helper to create and initialize testSpec.

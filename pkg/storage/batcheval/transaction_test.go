@@ -12,7 +12,6 @@ package batcheval
 
 import (
 	"context"
-	"math"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -129,7 +128,6 @@ func TestUpdateAbortSpan(t *testing.T) {
 		args := CommandArgs{
 			EvalCtx: rec,
 			Args:    &req,
-			MaxKeys: math.MaxInt64,
 		}
 
 		var resp roachpb.ResolveIntentRangeResponse
@@ -684,19 +682,19 @@ func TestUpdateAbortSpan(t *testing.T) {
 			defer db.Close()
 			batch := db.NewBatch()
 			defer batch.Close()
-			evalCtx := &mockEvalCtx{
-				desc:      &desc,
-				abortSpan: as,
-				canCreateTxnFn: func() (bool, hlc.Timestamp, roachpb.TransactionAbortedReason) {
+			evalCtx := &MockEvalCtx{
+				Desc:      &desc,
+				AbortSpan: as,
+				CanCreateTxn: func() (bool, hlc.Timestamp, roachpb.TransactionAbortedReason) {
 					return true, hlc.Timestamp{}, 0
 				},
 			}
 
 			if c.before != nil {
-				require.NoError(t, c.before(batch, evalCtx))
+				require.NoError(t, c.before(batch, evalCtx.EvalContext()))
 			}
 
-			err := c.run(batch, evalCtx)
+			err := c.run(batch, evalCtx.EvalContext())
 			if c.expErr != "" {
 				require.Regexp(t, c.expErr, err)
 			} else {

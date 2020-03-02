@@ -953,7 +953,7 @@ func mvccGetInternal(
 		// ignore the intent by insisting that the timestamp we're reading
 		// at is a historical timestamp < the intent timestamp. However, we
 		// return the intent separately; the caller may want to resolve it.
-		intent := roachpb.MakePendingIntent(meta.Txn, roachpb.Span{Key: metaKey.Key})
+		intent := roachpb.MakeIntent(meta.Txn, metaKey.Key)
 		ignoredIntent = &intent
 		timestamp = metaTimestamp.Prev()
 	}
@@ -973,7 +973,7 @@ func mvccGetInternal(
 		if metaTimestamp.LessEq(maxVisibleTimestamp) {
 			return nil, nil, safeValue, &roachpb.WriteIntentError{
 				Intents: []roachpb.Intent{
-					roachpb.MakePendingIntent(meta.Txn, roachpb.Span{Key: metaKey.Key}),
+					roachpb.MakeIntent(meta.Txn, metaKey.Key),
 				},
 			}
 		}
@@ -1512,7 +1512,7 @@ func mvccPutInternal(
 				// The current Put operation does not come from the same
 				// transaction.
 				return &roachpb.WriteIntentError{Intents: []roachpb.Intent{
-					roachpb.MakePendingIntent(meta.Txn, roachpb.Span{Key: key}),
+					roachpb.MakeIntent(meta.Txn, key),
 				}}
 			} else if txn.Epoch < meta.Txn.Epoch {
 				return errors.Errorf("put with epoch %d came after put with epoch %d in txn %s",
@@ -2208,7 +2208,7 @@ func MVCCClearTimeRange(
 			if meta.Txn != nil && startTime.Less(ts) && ts.LessEq(endTime) {
 				err := &roachpb.WriteIntentError{
 					Intents: []roachpb.Intent{
-						roachpb.MakePendingIntent(meta.Txn, roachpb.Span{Key: append([]byte{}, k.Key...)}),
+						roachpb.MakeIntent(meta.Txn, append([]byte{}, k.Key...)),
 					}}
 				return nil, err
 			}
@@ -2249,6 +2249,7 @@ func MVCCClearTimeRange(
 // end keys. It returns the range of keys deleted when returnedKeys is set,
 // the next span to resume from, and the number of keys deleted.
 // The returned resume span is nil if max keys aren't processed.
+// The choice max=0 disables the limit.
 func MVCCDeleteRange(
 	ctx context.Context,
 	rw ReadWriter,
@@ -2273,7 +2274,7 @@ func MVCCDeleteRange(
 		scanTxn = prevSeqTxn
 	}
 	res, err := MVCCScan(
-		ctx, rw, key, endKey, max, scanTs, MVCCScanOptions{Txn: scanTxn})
+		ctx, rw, key, endKey, scanTs, MVCCScanOptions{Txn: scanTxn, MaxKeys: max})
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -2307,7 +2308,6 @@ func mvccScanToBytes(
 	ctx context.Context,
 	iter Iterator,
 	key, endKey roachpb.Key,
-	max int64,
 	timestamp hlc.Timestamp,
 	opts MVCCScanOptions,
 ) (MVCCScanResult, error) {
@@ -2317,14 +2317,14 @@ func mvccScanToBytes(
 	if err := opts.validate(); err != nil {
 		return MVCCScanResult{}, err
 	}
-	if max == 0 {
+	if opts.MaxKeys < 0 || opts.TargetBytes < 0 {
 		resumeSpan := &roachpb.Span{Key: key, EndKey: endKey}
 		return MVCCScanResult{ResumeSpan: resumeSpan}, nil
 	}
 
 	// If the iterator has a specialized implementation, defer to that.
 	if mvccIter, ok := iter.(MVCCIterator); ok && mvccIter.MVCCOpsSpecialized() {
-		return mvccIter.MVCCScan(key, endKey, max, timestamp, opts)
+		return mvccIter.MVCCScan(key, endKey, timestamp, opts)
 	}
 
 	mvccScanner := pebbleMVCCScannerPool.Get().(*pebbleMVCCScanner)
@@ -2336,7 +2336,7 @@ func mvccScanToBytes(
 		start:            key,
 		end:              endKey,
 		ts:               timestamp,
-		maxKeys:          max,
+		maxKeys:          opts.MaxKeys,
 		targetBytes:      opts.TargetBytes,
 		inconsistent:     opts.Inconsistent,
 		tombstones:       opts.Tombstones,
@@ -2374,11 +2374,10 @@ func mvccScanToKvs(
 	ctx context.Context,
 	iter Iterator,
 	key, endKey roachpb.Key,
-	max int64,
 	timestamp hlc.Timestamp,
 	opts MVCCScanOptions,
 ) (MVCCScanResult, error) {
-	res, err := mvccScanToBytes(ctx, iter, key, endKey, max, timestamp, opts)
+	res, err := mvccScanToBytes(ctx, iter, key, endKey, timestamp, opts)
 	if err != nil {
 		return MVCCScanResult{}, err
 	}
@@ -2424,7 +2423,7 @@ func buildScanIntents(data []byte) ([]roachpb.Intent, error) {
 		if err := protoutil.Unmarshal(reader.Value(), &meta); err != nil {
 			return nil, err
 		}
-		intents = append(intents, roachpb.MakePendingIntent(meta.Txn, roachpb.Span{Key: key.Key}))
+		intents = append(intents, roachpb.MakeIntent(meta.Txn, key.Key))
 	}
 
 	if err := reader.Error(); err != nil {
@@ -2446,6 +2445,12 @@ type MVCCScanOptions struct {
 	Reverse          bool
 	FailOnMoreRecent bool
 	Txn              *roachpb.Transaction
+	// MaxKeys is the maximum number of kv pairs returned from this operation.
+	// The zero value represents an unbounded scan. If the limit stops the scan,
+	// a corresponding ResumeSpan is returned. As a special case, the value -1
+	// returns no keys in the result (returning the first key via the
+	// ResumeSpan).
+	MaxKeys int64
 	// TargetBytes is a byte threshold to limit the amount of data pulled into
 	// memory during a Scan operation. Once the target is satisfied (i.e. met or
 	// exceeded) by the emitted emitted KV pairs, iteration stops (with a
@@ -2491,11 +2496,7 @@ type MVCCScanResult struct {
 // not hit, the resume span will be nil. Otherwise, it will be the sub-span of
 // [key, endKey) that has not been scanned.
 //
-// For an unbounded scan, specify a max of MaxInt64. A max of zero means to
-// return no keys at all, which is probably not what you intend.
-//
-// TODO(benesch): Evaluate whether our behavior when max is zero still makes
-// sense. See #8084 for historical context.
+// For an unbounded scan, specify a max of zero.
 //
 // Only keys that with a timestamp less than or equal to the supplied timestamp
 // will be included in the scan results. If a transaction is provided and the
@@ -2524,13 +2525,12 @@ func MVCCScan(
 	ctx context.Context,
 	reader Reader,
 	key, endKey roachpb.Key,
-	max int64,
 	timestamp hlc.Timestamp,
 	opts MVCCScanOptions,
 ) (MVCCScanResult, error) {
 	iter := reader.NewIterator(IterOptions{LowerBound: key, UpperBound: endKey})
 	defer iter.Close()
-	return mvccScanToKvs(ctx, iter, key, endKey, max, timestamp, opts)
+	return mvccScanToKvs(ctx, iter, key, endKey, timestamp, opts)
 }
 
 // MVCCScanToBytes is like MVCCScan, but it returns the results in a byte array.
@@ -2538,13 +2538,12 @@ func MVCCScanToBytes(
 	ctx context.Context,
 	reader Reader,
 	key, endKey roachpb.Key,
-	max int64,
 	timestamp hlc.Timestamp,
 	opts MVCCScanOptions,
 ) (MVCCScanResult, error) {
 	iter := reader.NewIterator(IterOptions{LowerBound: key, UpperBound: endKey})
 	defer iter.Close()
-	return mvccScanToBytes(ctx, iter, key, endKey, max, timestamp, opts)
+	return mvccScanToBytes(ctx, iter, key, endKey, timestamp, opts)
 }
 
 // MVCCIterate iterates over the key range [start,end). At each step of the
@@ -2568,8 +2567,10 @@ func MVCCIterate(
 	var intents []roachpb.Intent
 	for {
 		const maxKeysPerScan = 1000
+		opts := opts
+		opts.MaxKeys = maxKeysPerScan
 		res, err := mvccScanToKvs(
-			ctx, iter, key, endKey, maxKeysPerScan, timestamp, opts)
+			ctx, iter, key, endKey, timestamp, opts)
 		if err != nil {
 			return nil, err
 		}
@@ -2631,7 +2632,7 @@ func MVCCIterate(
 // Doesn't look like this code here caught that. Shouldn't resolve intents
 // when they're not at the timestamp the Txn mandates them to be.
 func MVCCResolveWriteIntent(
-	ctx context.Context, rw ReadWriter, ms *enginepb.MVCCStats, intent roachpb.Intent,
+	ctx context.Context, rw ReadWriter, ms *enginepb.MVCCStats, intent roachpb.LockUpdate,
 ) (bool, error) {
 	iterAndBuf := GetBufUsingIter(rw.NewIterator(IterOptions{Prefix: true}))
 	ok, err := MVCCResolveWriteIntentUsingIter(ctx, rw, iterAndBuf, ms, intent)
@@ -2647,7 +2648,7 @@ func MVCCResolveWriteIntentUsingIter(
 	rw ReadWriter,
 	iterAndBuf IterAndBuf,
 	ms *enginepb.MVCCStats,
-	intent roachpb.Intent,
+	intent roachpb.LockUpdate,
 ) (bool, error) {
 	if len(intent.Key) == 0 {
 		return false, emptyKeyError()
@@ -2688,7 +2689,7 @@ func mvccResolveWriteIntent(
 	rw ReadWriter,
 	iter Iterator,
 	ms *enginepb.MVCCStats,
-	intent roachpb.Intent,
+	intent roachpb.LockUpdate,
 	buf *putBuffer,
 	forRange bool,
 ) (bool, error) {
@@ -3083,9 +3084,9 @@ func (b IterAndBuf) Cleanup() {
 // txns. Returns the number of intents resolved and a resume span if
 // the max keys limit was exceeded.
 func MVCCResolveWriteIntentRange(
-	ctx context.Context, rw ReadWriter, ms *enginepb.MVCCStats, intent roachpb.Intent, max int64,
+	ctx context.Context, rw ReadWriter, ms *enginepb.MVCCStats, intent roachpb.LockUpdate, max int64,
 ) (int64, *roachpb.Span, error) {
-	iterAndBuf := GetIterAndBuf(rw, IterOptions{UpperBound: intent.Span.EndKey})
+	iterAndBuf := GetIterAndBuf(rw, IterOptions{UpperBound: intent.EndKey})
 	defer iterAndBuf.Cleanup()
 	return MVCCResolveWriteIntentRangeUsingIter(ctx, rw, iterAndBuf, ms, intent, max)
 }
@@ -3094,13 +3095,13 @@ func MVCCResolveWriteIntentRange(
 // the range of write intents specified by start and end keys for a
 // given txn. ResolveWriteIntentRange will skip write intents of other
 // txns. Returns the number of intents resolved and a resume span if
-// the max keys limit was exceeded.
+// the max keys limit was exceeded. A max of zero means unbounded.
 func MVCCResolveWriteIntentRangeUsingIter(
 	ctx context.Context,
 	rw ReadWriter,
 	iterAndBuf IterAndBuf,
 	ms *enginepb.MVCCStats,
-	intent roachpb.Intent,
+	intent roachpb.LockUpdate,
 	max int64,
 ) (int64, *roachpb.Span, error) {
 	encKey := MakeMVCCMetadataKey(intent.Key)
@@ -3112,7 +3113,7 @@ func MVCCResolveWriteIntentRangeUsingIter(
 	intent.EndKey = nil
 
 	for {
-		if num == max {
+		if max > 0 && num == max {
 			return num, &roachpb.Span{Key: nextKey.Key, EndKey: encEndKey.Key}, nil
 		}
 
@@ -3708,7 +3709,7 @@ func checkForKeyCollisionsGo(
 				// target key space, which will require appropriate resolution logic.
 				writeIntentErr := roachpb.WriteIntentError{
 					Intents: []roachpb.Intent{
-						roachpb.MakePendingIntent(mvccMeta.Txn, roachpb.Span{Key: existingIter.Key().Key}),
+						roachpb.MakeIntent(mvccMeta.Txn, existingIter.Key().Key),
 					},
 				}
 

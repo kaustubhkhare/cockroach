@@ -164,31 +164,31 @@ var backwardCompatibleMigrations = []migrationDescriptor{
 	},
 	{
 		// Introduced in v2.1, repeat of 2.0 migration to catch mixed-version issues.
-		// TODO(mberhault): bake into v2.2.
+		// TODO(mberhault): bake into v19.1.
 		name: "repeat: ensure admin role privileges in all descriptors",
 	},
 	{
 		// Introduced in v2.1.
-		// TODO(mberhault): bake into v2.2.
+		// TODO(mberhault): bake into v19.1.
 		name:   "disallow public user or role name",
 		workFn: disallowPublicUserOrRole,
 	},
 	{
 		// Introduced in v2.1.
-		// TODO(knz): bake this migration into v2.2.
+		// TODO(knz): bake this migration into v19.1.
 		name:             "create default databases",
 		workFn:           createDefaultDbs,
 		newDescriptorIDs: databaseIDs(sessiondata.DefaultDatabaseName, sessiondata.PgDatabaseName),
 	},
 	{
 		// Introduced in v2.1.
-		// TODO(dt): Bake into v2.2.
+		// TODO(dt): Bake into v19.1.
 		name:   "add progress to system.jobs",
 		workFn: addJobsProgress,
 	},
 	{
-		// Introduced in v2.2.
-		// TODO(knz): bake this migration into v2.3.
+		// Introduced in v19.1.
+		// TODO(knz): bake this migration into v19.2
 		name:   "create system.comment table",
 		workFn: createCommentTable,
 		// This migration has been introduced some time before 19.2.
@@ -277,17 +277,34 @@ var backwardCompatibleMigrations = []migrationDescriptor{
 		newDescriptorIDs:    staticIDs(keys.ProtectedTimestampsRecordsTableID),
 	},
 	{
-		// Introduced in v20.1
+		// Introduced in v20.1.
 		name:                "create new system.namespace table",
 		workFn:              createNewSystemNamespaceDescriptor,
 		includedInBootstrap: cluster.VersionByKey(cluster.VersionNamespaceTableWithSchemas),
 		newDescriptorIDs:    staticIDs(keys.NamespaceTableID),
 	},
 	{
-		// Introduced in v20.1
+		// Introduced in v20.1.
 		name:                "migrate system.namespace_deprecated entries into system.namespace",
 		workFn:              migrateSystemNamespace,
 		includedInBootstrap: cluster.VersionByKey(cluster.VersionNamespaceTableWithSchemas),
+	},
+	{
+		// Introduced in v20.1.,
+		name:                "create system.role_options table with an entry for (admin, CREATEROLE)",
+		workFn:              createRoleOptionsTable,
+		includedInBootstrap: cluster.VersionByKey(cluster.VersionCreateRolePrivilege),
+		newDescriptorIDs:    staticIDs(keys.RoleOptionsTableID),
+	},
+	{
+		// Introduced in v20.1.
+		// TODO(andrei): Bake this migration into v20.2.
+		name: "create statement_diagnostics_requests, statement_diagnostics and " +
+			"system.statement_bundle_chunks tables",
+		workFn:              createStatementInfoSystemTables,
+		includedInBootstrap: cluster.VersionByKey(cluster.VersionStatementDiagnosticsSystemTables),
+		newDescriptorIDs: staticIDs(keys.StatementBundleChunksTableID,
+			keys.StatementDiagnosticsRequestsTableID, keys.StatementDiagnosticsTableID),
 	},
 }
 
@@ -736,6 +753,24 @@ func createNewSystemNamespaceDescriptor(ctx context.Context, r runner) error {
 	})
 }
 
+func createRoleOptionsTable(ctx context.Context, r runner) error {
+	// Create system.role_options table with an entry for (admin, CREATEROLE).
+	err := createSystemTable(ctx, r, sqlbase.RoleOptionsTable)
+	if err != nil {
+		return errors.Wrap(err, "failed to create system.role_options")
+	}
+
+	// Upsert the admin role with CreateRole privilege into the table.
+	// We intentionally override any existing entry.
+	const upsertAdminStmt = `
+          UPSERT INTO system.role_options (username, option, value) VALUES ($1, 'CREATEROLE', NULL)
+          `
+	return r.execAsRootWithRetry(ctx,
+		"add role options table and upsert admin with CREATEROLE",
+		upsertAdminStmt,
+		sqlbase.AdminRole)
+}
+
 // migrateSystemNamespace migrates entries from the deprecated system.namespace
 // table to the new one, which includes a parentSchemaID column. Each database
 // entry is copied to the new table along with a corresponding entry for the
@@ -796,6 +831,19 @@ func migrateSystemNamespace(ctx context.Context, r runner) error {
 
 func createReportsMetaTable(ctx context.Context, r runner) error {
 	return createSystemTable(ctx, r, sqlbase.ReportsMetaTable)
+}
+
+func createStatementInfoSystemTables(ctx context.Context, r runner) error {
+	if err := createSystemTable(ctx, r, sqlbase.StatementBundleChunksTable); err != nil {
+		return errors.Wrap(err, "failed to create system.statement_bundle_chunks")
+	}
+	if err := createSystemTable(ctx, r, sqlbase.StatementDiagnosticsRequestsTable); err != nil {
+		return errors.Wrap(err, "failed to create system.statement_diagnostics_requests")
+	}
+	if err := createSystemTable(ctx, r, sqlbase.StatementDiagnosticsTable); err != nil {
+		return errors.Wrap(err, "failed to create system.statement_diagnostics")
+	}
+	return nil
 }
 
 // SettingsDefaultOverrides documents the effect of several migrations that add

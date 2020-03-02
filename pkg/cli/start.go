@@ -407,7 +407,7 @@ func initTempStorageConfig(
 	return tempStorageConfig, nil
 }
 
-var errCannotUseJoin = errors.New("cannot use --join with 'cockroach start-single-node' -- use 'cockrach start' instead")
+var errCannotUseJoin = errors.New("cannot use --join with 'cockroach start-single-node' -- use 'cockroach start' instead")
 
 func runStartSingleNode(cmd *cobra.Command, args []string) error {
 	joinFlag := flagSetForCmd(cmd).Lookup(cliflags.Join.Name)
@@ -1136,7 +1136,8 @@ func setupAndInitializeLoggingAndProfiling(
 		// directory too large.
 		log.StartGCDaemon(ctx)
 
-		// We have a valid logging directory. Configure RocksDB to log into it.
+		// We have a valid logging directory. Configure Pebble/RocksDB to log into it.
+		engine.InitPebbleLogger(ctx)
 		engine.InitRocksDBLogger(ctx)
 	}
 

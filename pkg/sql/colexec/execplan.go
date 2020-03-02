@@ -17,6 +17,7 @@ import (
 	"reflect"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -28,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/errors"
+	"github.com/marusama/semaphore"
 )
 
 func checkNumIn(inputs []Operator, numIn int) error {
@@ -93,6 +95,8 @@ type NewColOperatorArgs struct {
 	Inputs               []Operator
 	StreamingMemAccount  *mon.BoundAccount
 	ProcessorConstructor execinfra.ProcessorConstructor
+	DiskQueueCfg         colcontainer.DiskQueueCfg
+	FDSemaphore          semaphore.Semaphore
 	TestingKnobs         struct {
 		// UseStreamingMemAccountForBuffering specifies whether to use
 		// StreamingMemAccount when creating buffering operators and should only be
@@ -108,17 +112,30 @@ type NewColOperatorArgs struct {
 		// DiskSpillingDisabled specifies whether only in-memory operators should
 		// be created.
 		DiskSpillingDisabled bool
+		// NumForcedRepartitions specifies a number of "repartitions" that a
+		// disk-backed operator should be forced to perform. "Repartition" can mean
+		// different things depending on the operator (for example, for hash joiner
+		// it is dividing original partition into multiple new partitions; for
+		// sorter it is merging already created partitions into new one before
+		// proceeding to the next partition from the input).
+		NumForcedRepartitions int
 	}
 }
 
 // NewColOperatorResult is a helper struct that encompasses all of the return
 // values of NewColOperator call.
 type NewColOperatorResult struct {
-	Op                     Operator
-	ColumnTypes            []types.T
-	InternalMemUsage       int
-	MetadataSources        []execinfrapb.MetadataSource
-	IsStreaming            bool
+	Op               Operator
+	ColumnTypes      []types.T
+	InternalMemUsage int
+	MetadataSources  []execinfrapb.MetadataSource
+	IsStreaming      bool
+	// CanRunInAutoMode returns whether the result can be run in auto mode if
+	// IsStreaming is false. This applies to operators that can spill to disk, but
+	// also operators such as the hash aggregator that buffer, but not
+	// proportionally to the input size (in the hash aggregator's case, it is the
+	// number of distinct groups).
+	CanRunInAutoMode       bool
 	BufferingOpMemMonitors []*mon.BytesMonitor
 	BufferingOpMemAccounts []*mon.BoundAccount
 }
@@ -162,6 +179,12 @@ func isSupported(spec *execinfrapb.ProcessorSpec) (bool, error) {
 		return true, nil
 
 	case core.Distinct != nil:
+		if core.Distinct.NullsAreDistinct {
+			return false, errors.Newf("distinct with unique nulls not supported")
+		}
+		if core.Distinct.ErrorOnDup != "" {
+			return false, errors.Newf("distinct with error on duplicates not supported")
+		}
 		return true, nil
 
 	case core.Ordinality != nil:
@@ -185,6 +208,16 @@ func isSupported(spec *execinfrapb.ProcessorSpec) (bool, error) {
 		return true, nil
 
 	case core.Sorter != nil:
+		inputTypes, err := typeconv.FromColumnTypes(spec.Input[0].ColumnTypes)
+		if err != nil {
+			return false, err
+		}
+		for _, t := range inputTypes {
+			if t == coltypes.Interval {
+				return false, errors.WithIssueLink(errors.Errorf("sort on interval type not supported"),
+					errors.IssueLink{IssueURL: "https://github.com/cockroachdb/cockroach/issues/45392"})
+			}
+		}
 		return true, nil
 
 	case core.Windower != nil:
@@ -201,6 +234,21 @@ func isSupported(spec *execinfrapb.ProcessorSpec) (bool, error) {
 		if wf.Func.AggregateFunc != nil {
 			return false, errors.Newf("aggregate functions used as window functions are not supported")
 		}
+		if len(core.Windower.PartitionBy) > 0 || len(wf.Ordering.Columns) > 0 {
+			// When we have non-empty PARTITION BY and ORDER BY clauses, we will need
+			// to plan a sorter which currently doesn't support operating on interval
+			// type.
+			inputTypes, err := typeconv.FromColumnTypes(spec.Input[0].ColumnTypes)
+			if err != nil {
+				return false, err
+			}
+			for _, t := range inputTypes {
+				if t == coltypes.Interval {
+					return false, errors.WithIssueLink(errors.Errorf("window functions involving interval type not supported"),
+						errors.IssueLink{IssueURL: "https://github.com/cockroachdb/cockroach/issues/45392"})
+				}
+			}
+		}
 
 		switch *wf.Func.WindowFunc {
 		case execinfrapb.WindowerSpec_ROW_NUMBER:
@@ -214,6 +262,138 @@ func isSupported(spec *execinfrapb.ProcessorSpec) (bool, error) {
 	default:
 		return false, errors.Newf("unsupported processor core %q", core)
 	}
+}
+
+// createDiskBackedSort creates a new disk-backed operator that sorts the input
+// according to ordering.
+// - matchLen specifies the length of the prefix of ordering columns the input
+// is already ordered on.
+// - processorID is the ProcessorID of the processor core that requested
+// creation of this operator. It is used only to distinguish memory monitors.
+// - post describes the post-processing spec of the processor. It will be used
+// to determine whether top K sort can be planned. If you want the general sort
+// operator, then pass in empty struct.
+func (r *NewColOperatorResult) createDiskBackedSort(
+	ctx context.Context,
+	flowCtx *execinfra.FlowCtx,
+	args NewColOperatorArgs,
+	input Operator,
+	inputTypes []coltypes.T,
+	ordering execinfrapb.Ordering,
+	matchLen uint32,
+	processorID int32,
+	post *execinfrapb.PostProcessSpec,
+	memMonitorNamePrefix string,
+) (Operator, error) {
+	streamingMemAccount := args.StreamingMemAccount
+	useStreamingMemAccountForBuffering := args.TestingKnobs.UseStreamingMemAccountForBuffering
+	var (
+		sorterMemMonitorName string
+		inMemorySorter       Operator
+		err                  error
+	)
+	if len(ordering.Columns) == int(matchLen) {
+		// The input is already fully ordered, so there is nothing to sort.
+		return input, nil
+	}
+	for _, t := range inputTypes {
+		if t == coltypes.Interval {
+			execerror.VectorizedInternalPanic("attempted to create a sort on interval type after isSupported check")
+		}
+	}
+	if matchLen > 0 {
+		// The input is already partially ordered. Use a chunks sorter to avoid
+		// loading all the rows into memory.
+		sorterMemMonitorName = fmt.Sprintf("%ssort-chunks-%d", memMonitorNamePrefix, processorID)
+		var sortChunksMemAccount *mon.BoundAccount
+		if useStreamingMemAccountForBuffering {
+			sortChunksMemAccount = streamingMemAccount
+		} else {
+			sortChunksMemAccount = r.createBufferingMemAccount(
+				ctx, flowCtx, sorterMemMonitorName,
+			)
+		}
+		inMemorySorter, err = NewSortChunks(
+			NewAllocator(ctx, sortChunksMemAccount), input, inputTypes,
+			ordering.Columns, int(matchLen),
+		)
+	} else if post.Limit != 0 && post.Filter.Empty() && post.Limit+post.Offset < math.MaxUint16 {
+		// There is a limit specified with no post-process filter, so we know
+		// exactly how many rows the sorter should output. Choose a top K sorter,
+		// which uses a heap to avoid storing more rows than necessary.
+		sorterMemMonitorName = fmt.Sprintf("%stopk-sort-%d", memMonitorNamePrefix, processorID)
+		var topKSorterMemAccount *mon.BoundAccount
+		if useStreamingMemAccountForBuffering {
+			topKSorterMemAccount = streamingMemAccount
+		} else {
+			topKSorterMemAccount = r.createBufferingMemAccount(
+				ctx, flowCtx, sorterMemMonitorName,
+			)
+		}
+		k := uint16(post.Limit + post.Offset)
+		inMemorySorter = NewTopKSorter(
+			NewAllocator(ctx, topKSorterMemAccount), input, inputTypes,
+			ordering.Columns, k,
+		)
+	} else {
+		// No optimizations possible. Default to the standard sort operator.
+		sorterMemMonitorName = fmt.Sprintf("%ssort-all-%d", memMonitorNamePrefix, processorID)
+		var sorterMemAccount *mon.BoundAccount
+		if useStreamingMemAccountForBuffering {
+			sorterMemAccount = streamingMemAccount
+		} else {
+			sorterMemAccount = r.createBufferingMemAccount(
+				ctx, flowCtx, sorterMemMonitorName,
+			)
+		}
+		inMemorySorter, err = NewSorter(
+			NewAllocator(ctx, sorterMemAccount), input, inputTypes, ordering.Columns,
+		)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if inMemorySorter == nil {
+		return nil, errors.AssertionFailedf("unexpectedly inMemorySorter is nil")
+	}
+	// NOTE: when spilling to disk, we're using the same general external
+	// sorter regardless of which sorter variant we have instantiated (i.e.
+	// we don't take advantage of the limits and of partial ordering). We
+	// could improve this.
+	return newOneInputDiskSpiller(
+		input, inMemorySorter.(bufferingInMemoryOperator),
+		sorterMemMonitorName,
+		func(input Operator) Operator {
+			monitorNamePrefix := fmt.Sprintf("%sexternal-sorter", memMonitorNamePrefix)
+			// We are using an unlimited memory monitor here because external
+			// sort itself is responsible for making sure that we stay within
+			// the memory limit.
+			unlimitedAllocator := NewAllocator(
+				ctx, r.createBufferingUnlimitedMemAccount(
+					ctx, flowCtx, monitorNamePrefix,
+				))
+			standaloneMemAccount := r.createStandaloneMemAccount(
+				ctx, flowCtx, monitorNamePrefix,
+			)
+			// Make a copy of the DiskQueueCfg and set defaults for the sorter.
+			// The cache mode is chosen to reuse the cache to have a smaller
+			// cache per partition without affecting performance.
+			diskQueueCfg := args.DiskQueueCfg
+			diskQueueCfg.CacheMode = colcontainer.DiskQueueCacheModeReuseCache
+			diskQueueCfg.SetDefaultBufferSizeBytesForCacheMode()
+			return newExternalSorter(
+				ctx,
+				unlimitedAllocator,
+				standaloneMemAccount,
+				input, inputTypes, ordering,
+				execinfra.GetWorkMemLimit(flowCtx.Cfg),
+				args.TestingKnobs.NumForcedRepartitions,
+				diskQueueCfg,
+				args.FDSemaphore,
+			)
+		},
+		args.TestingKnobs.SpillingCallbackFn,
+	), nil
 }
 
 // NewColOperator creates a new columnar operator according to the given spec.
@@ -433,11 +613,17 @@ func NewColOperator(
 			if needHash {
 				hashAggregatorMemAccount := streamingMemAccount
 				if !useStreamingMemAccountForBuffering {
-					hashAggregatorMemAccount = result.createBufferingMemAccount(ctx, flowCtx, "hash-aggregator")
+					// Create an unlimited mem account explicitly even though there is no
+					// disk spilling because the memory usage of an aggregator is
+					// proportional to the number of groups, not the number of inputs.
+					// The row execution engine also gives an unlimited amount (that still
+					// needs to be approved by the upstream monitor, so not really
+					// "unlimited") amount of memory to the aggregator.
+					hashAggregatorMemAccount = result.createBufferingUnlimitedMemAccount(ctx, flowCtx, "hash-aggregator")
 				}
 				result.Op, err = NewHashAggregator(
 					NewAllocator(ctx, hashAggregatorMemAccount), inputs[0], typs, aggFns,
-					aggSpec.GroupCols, aggCols, execinfrapb.IsScalarAggregate(aggSpec),
+					aggSpec.GroupCols, aggCols,
 				)
 			} else {
 				result.Op, err = NewOrderedAggregator(
@@ -545,33 +731,24 @@ func NewColOperator(
 					inputs[0], inputs[1], inMemoryHashJoiner.(bufferingInMemoryOperator),
 					hashJoinerMemMonitorName,
 					func(inputOne, inputTwo Operator) Operator {
-						monitorNamePrefix := "external-hash-joiner-"
-						// We need to create an allocator for external hash joiner to
-						// use, and the allocator needs to have some reasonable amount of
-						// memory to work with (because the external hash joiner creates
-						// several batches internally as well as uses an instance of
-						// in-memory hash joiner). We need to overwrite the testing
-						// memory limit before creating the memory account for the
-						// allocator because if we don't, the constructor below will
-						// result in an OOM panic or the internal in-memory hash joiner
-						// can hit the limit forcing us to do recursive partitioning
-						// (which is currently not supported).
-						defer func(oldLimit int64) {
-							flowCtx.Cfg.TestingKnobs.MemoryLimitBytes = oldLimit
-						}(flowCtx.Cfg.TestingKnobs.MemoryLimitBytes)
-						flowCtx.Cfg.TestingKnobs.MemoryLimitBytes = 0
-						allocator := NewAllocator(
-							ctx, result.createBufferingMemAccount(
+						monitorNamePrefix := "external-hash-joiner"
+						unlimitedAllocator := NewAllocator(
+							ctx, result.createBufferingUnlimitedMemAccount(
 								ctx, flowCtx, monitorNamePrefix,
 							))
-						diskQueuesUnlimitedAllocator := NewAllocator(
-							ctx, result.createBufferingUnlimitedMemAccount(
-								ctx, flowCtx, monitorNamePrefix+"disk-queues",
-							))
+						// Make a copy of the DiskQueueCfg and set defaults for the hash
+						// joiner. The cache mode is chosen to automatically close the cache
+						// belonging to partitions at a parent level when repartitioning.
+						diskQueueCfg := args.DiskQueueCfg
+						diskQueueCfg.CacheMode = colcontainer.DiskQueueCacheModeClearAndReuseCache
+						diskQueueCfg.SetDefaultBufferSizeBytesForCacheMode()
 						return newExternalHashJoiner(
-							allocator, hjSpec,
+							unlimitedAllocator, hjSpec,
 							inputOne, inputTwo,
-							diskQueuesUnlimitedAllocator,
+							execinfra.GetWorkMemLimit(flowCtx.Cfg),
+							diskQueueCfg,
+							args.FDSemaphore,
+							args.TestingKnobs.NumForcedRepartitions,
 						)
 					},
 					args.TestingKnobs.SpillingCallbackFn,
@@ -650,8 +827,13 @@ func NewColOperator(
 
 			mergeJoinerMemAccount := streamingMemAccount
 			if !result.IsStreaming && !useStreamingMemAccountForBuffering {
-				// Whether the merge joiner is streaming is already set above.
-				mergeJoinerMemAccount = result.createBufferingMemAccount(ctx, flowCtx, "merge-joiner")
+				// If the merge joiner is buffering, create an unlimited buffering
+				// account for now.
+				// TODO(asubiotto): Once we support spilling to disk in the merge
+				//  joiner, make this a limited account. Done this way so that we can
+				//  still run plans that include a merge join with a low memory limit
+				//  to test disk spilling of other components for the time being.
+				mergeJoinerMemAccount = result.createBufferingUnlimitedMemAccount(ctx, flowCtx, "merge-joiner")
 			}
 			result.Op, err = NewMergeJoinOp(
 				NewAllocator(ctx, mergeJoinerMemAccount),
@@ -694,75 +876,17 @@ func NewColOperator(
 			if err != nil {
 				return result, err
 			}
-			orderingCols := core.Sorter.OutputOrdering.Columns
+			ordering := core.Sorter.OutputOrdering
 			matchLen := core.Sorter.OrderingMatchLen
-			if matchLen > 0 {
-				// The input is already partially ordered. Use a chunks sorter to avoid
-				// loading all the rows into memory.
-				var sortChunksMemAccount *mon.BoundAccount
-				if useStreamingMemAccountForBuffering {
-					sortChunksMemAccount = streamingMemAccount
-				} else {
-					sortChunksMemAccount = result.createBufferingMemAccount(ctx, flowCtx, "sort-chunks")
-				}
-				result.Op, err = NewSortChunks(
-					NewAllocator(ctx, sortChunksMemAccount), input, inputTypes,
-					orderingCols, int(matchLen),
-				)
-			} else if post.Limit != 0 && post.Filter.Empty() && post.Limit+post.Offset < math.MaxUint16 {
-				// There is a limit specified with no post-process filter, so we know
-				// exactly how many rows the sorter should output. Choose a top K sorter,
-				// which uses a heap to avoid storing more rows than necessary.
-				k := uint16(post.Limit + post.Offset)
-				result.Op = NewTopKSorter(
-					NewAllocator(ctx, streamingMemAccount), input, inputTypes,
-					orderingCols, k,
-				)
-				result.IsStreaming = true
-			} else {
-				// No optimizations possible. Default to the standard sort operator.
-				sorterMemMonitorName := fmt.Sprintf("sort-all-%d", spec.ProcessorID)
-				var sorterMemAccount *mon.BoundAccount
-				if useStreamingMemAccountForBuffering {
-					sorterMemAccount = streamingMemAccount
-				} else {
-					sorterMemAccount = result.createBufferingMemAccount(
-						ctx, flowCtx, sorterMemMonitorName,
-					)
-				}
-				inMemorySorter, err := NewSorter(
-					NewAllocator(ctx, sorterMemAccount), input, inputTypes, orderingCols,
-				)
-				if err != nil {
-					return result, err
-				}
-				result.Op = newOneInputDiskSpiller(
-					input, inMemorySorter.(bufferingInMemoryOperator),
-					sorterMemMonitorName,
-					func(input Operator) Operator {
-						monitorNamePrefix := "external-sorter-"
-						// We are using an unlimited memory monitor here because external
-						// sort itself is responsible for making sure that we stay within
-						// the memory limit.
-						unlimitedAllocator := NewAllocator(
-							ctx, result.createBufferingUnlimitedMemAccount(
-								ctx, flowCtx, monitorNamePrefix,
-							))
-						diskQueuesUnlimitedAllocator := NewAllocator(
-							ctx, result.createBufferingUnlimitedMemAccount(
-								ctx, flowCtx, monitorNamePrefix+"disk-queues",
-							))
-						return newExternalSorter(
-							unlimitedAllocator,
-							input, inputTypes, core.Sorter.OutputOrdering,
-							execinfra.GetWorkMemLimit(flowCtx.Cfg),
-							diskQueuesUnlimitedAllocator,
-						)
-					},
-					args.TestingKnobs.SpillingCallbackFn,
-				)
-			}
+			result.Op, err = result.createDiskBackedSort(
+				ctx, flowCtx, args, input, inputTypes, ordering, matchLen,
+				spec.ProcessorID, post, "", /* memMonitorNamePrefix */
+			)
 			result.ColumnTypes = spec.Input[0].ColumnTypes
+			// A sorter can run in auto mode because it falls back to disk if there
+			// is not enough memory available.
+			// TODO(asubiotto): Currently disabled
+			// result.CanRunInAutoMode = true
 
 		case core.Windower != nil:
 			if err := checkNumIn(inputs, 1); err != nil {
@@ -776,32 +900,36 @@ func NewColOperator(
 				return result, err
 			}
 			tempPartitionColOffset, partitionColIdx := 0, -1
+			memMonitorsPrefix := "window-"
 			if len(core.Windower.PartitionBy) > 0 {
 				// TODO(yuzefovich): add support for hashing partitioner (probably by
 				// leveraging hash routers once we can distribute). The decision about
 				// which kind of partitioner to use should come from the optimizer.
 				windowSortingPartitionerMemAccount := streamingMemAccount
 				if !useStreamingMemAccountForBuffering {
-					windowSortingPartitionerMemAccount = result.createBufferingMemAccount(ctx, flowCtx, "window-sorting-partitioner")
+					windowSortingPartitionerMemAccount = result.createBufferingMemAccount(
+						ctx, flowCtx, memMonitorsPrefix+"sorting-partitioner",
+					)
 				}
 				input, err = NewWindowSortingPartitioner(
 					NewAllocator(ctx, windowSortingPartitionerMemAccount), input, typs,
 					core.Windower.PartitionBy, wf.Ordering.Columns, int(wf.OutputColIdx),
+					func(input Operator, inputTypes []coltypes.T, orderingCols []execinfrapb.Ordering_Column) (Operator, error) {
+						return result.createDiskBackedSort(
+							ctx, flowCtx, args, input, inputTypes,
+							execinfrapb.Ordering{Columns: orderingCols},
+							0 /* matchLen */, spec.ProcessorID,
+							&execinfrapb.PostProcessSpec{}, memMonitorsPrefix)
+					},
 				)
 				tempPartitionColOffset, partitionColIdx = 1, int(wf.OutputColIdx)
 			} else {
 				if len(wf.Ordering.Columns) > 0 {
-					windowSorterMemAccount := streamingMemAccount
-					if !useStreamingMemAccountForBuffering {
-						windowSorterMemAccount = result.createBufferingMemAccount(ctx, flowCtx, "window-sorter")
-					}
-					input, err = NewSorter(
-						NewAllocator(ctx, windowSorterMemAccount), input, typs,
-						wf.Ordering.Columns,
+					input, err = result.createDiskBackedSort(
+						ctx, flowCtx, args, input, typs, wf.Ordering, 0, /* matchLen */
+						spec.ProcessorID, &execinfrapb.PostProcessSpec{}, memMonitorsPrefix,
 					)
 				}
-				// TODO(yuzefovich): when both PARTITION BY and ORDER BY clauses are
-				// omitted, the window function operator is actually streaming.
 			}
 			if err != nil {
 				return result, err
@@ -832,6 +960,11 @@ func NewColOperator(
 			}
 
 			result.ColumnTypes = append(spec.Input[0].ColumnTypes, *types.Int)
+			// Window functions can run in auto mode because they are streaming
+			// operators and internally they use a sorter which can fall back to disk
+			// if needed.
+			// TODO(yuzefovich): currently disabled.
+			// result.CanRunInAutoMode = true
 
 		default:
 			return result, errors.Newf("unsupported processor core %q", core)
@@ -941,8 +1074,8 @@ func (r *NewColOperatorResult) createBufferingUnlimitedMemMonitor(
 }
 
 // createBufferingMemAccount instantiates a memory monitor and a memory account
-// to be used with a buffering Operator. The receiver is updated to have
-// references to both objects.
+// to be used with a buffering Operator with the default memory limit. The
+// receiver is updated to have references to both objects.
 func (r *NewColOperatorResult) createBufferingMemAccount(
 	ctx context.Context, flowCtx *execinfra.FlowCtx, name string,
 ) *mon.BoundAccount {
@@ -965,6 +1098,31 @@ func (r *NewColOperatorResult) createBufferingUnlimitedMemAccount(
 	bufferingMemAccount := bufferingOpUnlimitedMemMonitor.MakeBoundAccount()
 	r.BufferingOpMemAccounts = append(r.BufferingOpMemAccounts, &bufferingMemAccount)
 	return &bufferingMemAccount
+}
+
+// createStandaloneMemAccount instantiates an unlimited memory monitor and a
+// memory account that have a standalone budget. This means that the memory
+// registered with these objects is *not* reported to the root monitor (i.e.
+// it will not count towards max-sql-memory). Use it only when the memory in
+// use is accounted for with a different memory monitor. The receiver is
+// updated to have references to both objects.
+func (r *NewColOperatorResult) createStandaloneMemAccount(
+	ctx context.Context, flowCtx *execinfra.FlowCtx, name string,
+) *mon.BoundAccount {
+	standaloneMemMonitor := mon.MakeMonitor(
+		name+"-standalone",
+		mon.MemoryResource,
+		nil,           /* curCount */
+		nil,           /* maxHist */
+		-1,            /* increment: use default increment */
+		math.MaxInt64, /* noteworthy */
+		flowCtx.Cfg.Settings,
+	)
+	r.BufferingOpMemMonitors = append(r.BufferingOpMemMonitors, &standaloneMemMonitor)
+	standaloneMemMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+	standaloneMemAccount := standaloneMemMonitor.MakeBoundAccount()
+	r.BufferingOpMemAccounts = append(r.BufferingOpMemAccounts, &standaloneMemAccount)
+	return &standaloneMemAccount
 }
 
 func (r *NewColOperatorResult) planFilterExpr(

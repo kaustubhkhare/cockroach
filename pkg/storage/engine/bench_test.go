@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/storage/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -137,10 +138,11 @@ func setupMVCCData(
 		key := keys[idx]
 		txnMeta := txn.TxnMeta
 		txnMeta.WriteTimestamp = hlc.Timestamp{WallTime: int64(counts[idx]) * 5}
-		if _, err := MVCCResolveWriteIntent(ctx, batch, nil /* ms */, roachpb.Intent{
-			Span:   roachpb.Span{Key: key},
-			Status: roachpb.COMMITTED,
-			Txn:    txnMeta,
+		if _, err := MVCCResolveWriteIntent(ctx, batch, nil /* ms */, roachpb.LockUpdate{
+			Span:       roachpb.Span{Key: key},
+			Status:     roachpb.COMMITTED,
+			Txn:        txnMeta,
+			Durability: lock.Replicated,
 		}); err != nil {
 			b.Fatal(err)
 		}
@@ -240,7 +242,8 @@ func runMVCCScan(ctx context.Context, b *testing.B, emk engineMaker, opts benchS
 		endKey = endKey.Next()
 		walltime := int64(5 * (rand.Int31n(int32(opts.numVersions)) + 1))
 		ts := hlc.Timestamp{WallTime: walltime}
-		res, err := MVCCScan(ctx, eng, startKey, endKey, int64(opts.numRows), ts, MVCCScanOptions{
+		res, err := MVCCScan(ctx, eng, startKey, endKey, ts, MVCCScanOptions{
+			MaxKeys: int64(opts.numRows),
 			Reverse: opts.reverse,
 		})
 		if err != nil {

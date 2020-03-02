@@ -13,6 +13,8 @@ package jobs
 import (
 	"context"
 	"fmt"
+	"reflect"
+	"sync/atomic"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -55,6 +57,27 @@ type Record struct {
 	RunningStatus RunningStatus
 }
 
+// StartableJob is a job created with a transaction to be started later.
+// See Registry.CreateStartableJob
+type StartableJob struct {
+	*Job
+	txn        *client.Txn
+	resumer    Resumer
+	resumerCtx context.Context
+	cancel     context.CancelFunc
+	resultsCh  chan<- tree.Datums
+	starts     int64 // used to detect multiple calls to Start()
+}
+
+func init() {
+	// NB: This exists to make the jobs payload usable during testrace. See the
+	// comment on protoutil.Clone and the implementation of Marshal when run under
+	// race.
+	var jobPayload jobspb.Payload
+	jobsDetailsInterfaceType := reflect.TypeOf(&jobPayload.Details).Elem()
+	protoutil.RegisterUnclonableType(jobsDetailsInterfaceType, reflect.Array)
+}
+
 // Status represents the status of a job in the system.jobs table.
 type Status string
 
@@ -90,6 +113,10 @@ const (
 	// job will change its state to StatusPaused the next time it runs
 	// maybeAdoptJobs and will stop running it.
 	StatusPauseRequested Status = "pause-requested"
+)
+
+var (
+	errJobCanceled = errors.New("job canceled by user")
 )
 
 // Terminal returns whether this status represents a "terminal" state: a state
@@ -325,7 +352,7 @@ func (j *Job) resumed(ctx context.Context) error {
 		}
 		// We use the absence of error to determine what state we should
 		// resume into.
-		if md.Payload.Error == "" {
+		if md.Payload.FinalResumeError == nil {
 			ju.UpdateStatus(StatusRunning)
 		} else {
 			ju.UpdateStatus(StatusReverting)
@@ -351,11 +378,12 @@ func (j *Job) cancelRequested(
 		if md.Status == StatusCancelRequested || md.Status == StatusCanceled {
 			return nil
 		}
-		if md.Payload.Error != "" {
-			return fmt.Errorf("job with %s cannot be requested to be canceled", md.Payload.Error)
-		}
 		if md.Status != StatusPending && md.Status != StatusRunning && md.Status != StatusPaused {
 			return fmt.Errorf("job with status %s cannot be requested to be canceled", md.Status)
+		}
+		if md.Status == StatusPaused && md.Payload.FinalResumeError != nil {
+			decodedErr := errors.DecodeError(ctx, *md.Payload.FinalResumeError)
+			return fmt.Errorf("job %d is paused and has non-nil FinalResumeError %s hence cannot be canceled and should be reverted", j.ID(), decodedErr.Error())
 		}
 		if fn != nil {
 			if err := fn(ctx, txn); err != nil {
@@ -392,7 +420,9 @@ func (j *Job) pauseRequested(
 }
 
 // Reverted sets the status of the tracked job to reverted.
-func (j *Job) Reverted(ctx context.Context, fn func(context.Context, *client.Txn) error) error {
+func (j *Job) Reverted(
+	ctx context.Context, err error, fn func(context.Context, *client.Txn) error,
+) error {
 	return j.Update(ctx, func(txn *client.Txn, md JobMetadata, ju *JobUpdater) error {
 		if md.Status == StatusReverting {
 			return nil
@@ -403,6 +433,17 @@ func (j *Job) Reverted(ctx context.Context, fn func(context.Context, *client.Txn
 		if fn != nil {
 			if err := fn(ctx, txn); err != nil {
 				return err
+			}
+		}
+		if err != nil {
+			md.Payload.Error = err.Error()
+			encodedErr := errors.EncodeError(ctx, err)
+			md.Payload.FinalResumeError = &encodedErr
+			ju.UpdatePayload(md.Payload)
+		} else {
+			if md.Payload.FinalResumeError == nil {
+				return errors.AssertionFailedf(
+					"tried to mark job as reverting, but no error was provided or recorded")
 			}
 		}
 		ju.UpdateStatus(StatusReverting)
@@ -448,8 +489,6 @@ func (j *Job) Failed(
 		}
 		ju.UpdateStatus(StatusFailed)
 		md.Payload.Error = err.Error()
-		encodedErr := errors.EncodeError(ctx, err)
-		md.Payload.ResumeErrors = append(md.Payload.ResumeErrors, &encodedErr)
 		md.Payload.FinishedMicros = timeutil.ToUnixMicros(j.registry.clock.Now().GoTime())
 		ju.UpdatePayload(md.Payload)
 		return nil
@@ -514,6 +553,17 @@ func (j *Job) Progress() jobspb.Progress {
 	return j.mu.progress
 }
 
+// ToProto returns the protobuf representation of the job.
+func (j *Job) ToProto() *jobspb.Job {
+	jpb := &jobspb.Job{}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	jpb.Id = *j.ID()
+	jpb.Payload = protoutil.Clone(&j.mu.payload).(*jobspb.Payload)
+	jpb.Progress = protoutil.Clone(&j.mu.progress).(*jobspb.Progress)
+	return jpb
+}
+
 // Details returns the details from the most recently sent Payload for this Job.
 func (j *Job) Details() jobspb.Details {
 	j.mu.Lock()
@@ -545,6 +595,25 @@ func (j *Job) runInTxn(ctx context.Context, fn func(context.Context, *client.Txn
 	return j.registry.db.Txn(ctx, fn)
 }
 
+// JobNotFoundError is returned from load when the job does not exist.
+type JobNotFoundError struct {
+	jobID int64
+}
+
+// Error makes JobNotFoundError an error.
+func (e *JobNotFoundError) Error() string {
+	return fmt.Sprintf("job with ID %d does not exist", e.jobID)
+}
+
+// HasJobNotFoundError returns true if the error contains a JobNotFoundError.
+func HasJobNotFoundError(err error) bool {
+	_, hasJobNotFoundError := errors.If(err, func(err error) (interface{}, bool) {
+		_, isJobNotFoundError := err.(*JobNotFoundError)
+		return err, isJobNotFoundError
+	})
+	return hasJobNotFoundError
+}
+
 func (j *Job) load(ctx context.Context) error {
 	var payload *jobspb.Payload
 	var progress *jobspb.Progress
@@ -557,7 +626,7 @@ func (j *Job) load(ctx context.Context) error {
 			return err
 		}
 		if row == nil {
-			return fmt.Errorf("job with ID %d does not exist", *j.ID())
+			return &JobNotFoundError{jobID: *j.ID()}
 		}
 		payload, err = UnmarshalPayload(row[0])
 		if err != nil {
@@ -676,4 +745,46 @@ func (j *Job) CurrentStatus(ctx context.Context) (Status, error) {
 		return "", err
 	}
 	return Status(statusString), nil
+}
+
+// Start will resume the job. The transaction used to create the StartableJob
+// must be committed. If a non-nil error is returned, the job was not started
+// and nothing will be send on errCh. Clients must not start jobs more than
+// once.
+func (sj *StartableJob) Start(ctx context.Context) (errCh <-chan error, err error) {
+	if starts := atomic.AddInt64(&sj.starts, 1); starts != 1 {
+		return nil, errors.AssertionFailedf(
+			"StartableJob %d cannot be started more than once", *sj.ID())
+	}
+	defer func() {
+		if err != nil {
+			sj.registry.unregister(*sj.ID())
+		}
+	}()
+	if !sj.txn.IsCommitted() {
+		return nil, fmt.Errorf("cannot resume %T job which is not committed", sj.resumer)
+	}
+	if err := sj.Started(ctx); err != nil {
+		return nil, err
+	}
+	errCh, err = sj.registry.resume(sj.resumerCtx, sj.resumer, sj.resultsCh, sj.Job)
+	if err != nil {
+		return nil, err
+	}
+	return errCh, nil
+}
+
+// CleanupOnRollback will unregister the job in the case that the creating
+// transaction has been rolled back.
+func (sj *StartableJob) CleanupOnRollback(ctx context.Context) error {
+	if sj.txn.IsCommitted() {
+		return errors.AssertionFailedf(
+			"cannot call CleanupOnRollback for a StartableJob created by a committed transaction")
+	}
+	if !sj.txn.Sender().TxnStatus().IsFinalized() {
+		return errors.AssertionFailedf(
+			"cannot call CleanupOnRollback for a StartableJob with a non-finalized transaction")
+	}
+	sj.registry.unregister(*sj.ID())
+	return nil
 }

@@ -126,27 +126,29 @@ func (w *diskQueueWriter) numBytesBuffered() int {
 	return w.buffer.Len()
 }
 
+// diskQueueState describes the current state of the disk queue. Used to assert
+// that an invalid state transition doesn't happen when a DiskQueue is in
+// DiskQueueCacheMode{ClearAnd}ReuseCache.
+type diskQueueState int
+
+const (
+	diskQueueStateEnqueueing diskQueueState = iota
+	diskQueueStateDequeueing
+)
+
 // diskQueue is an on-disk queue of coldata.Batches that implements the Queue
-// interface. coldata.Batches are serialized and buffered up until
-// DiskQueueCfg.BufferSizeBytes are reached, after which they are compressed and
-// flushed to a file. A directory with a random UUID name will be created in
-// cfg.Path, and files will be created in that directory using sequence numbers.
+// interface. coldata.Batches are serialized and buffered up, after which they
+// are compressed and flushed to a file. A directory with a random UUID name
+// will be created in cfg.Path, and files will be created in that directory
+// using sequence numbers.
 // When a file reaches DiskQueueCfg.MaxFileSizeBytes, a new file is created with
 // the next sequential file number to store the next batches in the queue.
 // Note that files will be cleaned up as coldata.Batches are dequeued from the
 // diskQueue. DiskQueueCfg.Dir will also be removed on Close, deleting all files.
 // A diskQueue will never use more memory than cfg.BufferSizeBytes, but not all
-// the available memory will be used to buffer only writes. A third will be used
-// to buffer uncompressed writes, a third for the compressed writes and
-// compressed reads, and a final third for the decompressed writes. The division
-// of space is done in this particular way simply in order to give reads and
-// writes the same amount of buffer space.
-// NOTE: We could reuse the memory used to buffer uncompressed writes to buffer
-// uncompressed reads, but this would only work with the limitation that all
-// writes happen before all reads.
-// TODO(asubiotto): The improvement mentioned above might be worth it once we
-//  ensure that we only use DiskQueues for the write-everything, read-everything
-//  pattern.
+// the available memory will be used to buffer only writes. Refer to the
+// DiskQueueCacheMode comment as to how cfg.BufferSizeBytes is divided in each
+// mode.
 type diskQueue struct {
 	// dirName is the directory in cfg.Path that holds this queue's files.
 	dirName string
@@ -156,6 +158,9 @@ type diskQueue struct {
 	files []file
 	seqNo int
 
+	state diskQueueState
+
+	// done is set when a coldata.ZeroBatch has been Enqueued.
 	done bool
 
 	serializer *colserde.FileSerializer
@@ -165,9 +170,12 @@ type diskQueue struct {
 	// no batches have been enqueued (due to metadata).
 	numBufferedBatches int
 	writer             *diskQueueWriter
-	writeFileIdx       int
-	writeFile          fs.File
-	deserializerState  struct {
+	// writeBufferLimit is the limit on the number of uncompressed write bytes
+	// written before a compress and flush.
+	writeBufferLimit  int
+	writeFileIdx      int
+	writeFile         fs.File
+	deserializerState struct {
 		*colserde.FileDeserializer
 		curBatch int
 	}
@@ -194,14 +202,55 @@ type Queue interface {
 	// to. If an error is returned, the batch and boolean returned are
 	// meaningless.
 	Dequeue(coldata.Batch) (bool, error)
+	// CloseRead closes the read file descriptor. If Dequeued, the file may be
+	// reopened.
+	CloseRead() error
 	// Close closes any resources associated with the Queue.
 	Close() error
 }
 
 const (
-	// These values were chosen by running BenchmarkQueue.
-	defaultBufferSizeBytes  = 128 << 10 /* 128 KiB */
-	defaultMaxFileSizeBytes = 32 << 20  /* 32 MiB */
+	// defaultBufferSizeBytesDefaultCacheMode is the default buffer size used when
+	// the DiskQueue is in DiskQueueCacheModeDefault.
+	// This value was chosen by running BenchmarkQueue.
+	defaultBufferSizeBytesDefaultCacheMode = 128 << 10 /* 128 KiB */
+	// defaultBufferSizeBytesReuseCacheMode is the default buffer size used when
+	// the DiskQueue is in DiskQueueCacheMode{ClearAnd}ReuseCache.
+	defaultBufferSizeBytesReuseCacheMode = 64 << 10 /* 64 KiB */
+	// defaultMaxFileSizeBytes is the default maximum file size after which the
+	// DiskQueue rolls over to a new file. This value was chosen by running
+	// BenchmarkQueue.
+	defaultMaxFileSizeBytes = 32 << 20 /* 32 MiB */
+)
+
+// DiskQueueCacheMode specifies a pattern that a DiskQueue should use regarding
+// its cache.
+type DiskQueueCacheMode int
+
+const (
+	// DiskQueueCacheModeDefault is the default mode for DiskQueue cache behavior.
+	// The cache (DiskQueueCfg.BufferSizeBytes) will be divided as follows:
+	// - 1/3 for buffered writes (before compression)
+	// - 1/3 for compressed writes, this is distinct from the previous 1/3 because
+	//   it is a requirement of the snappy library that the compressed memory may
+	//   not overlap with the uncompressed memory. This memory is reused to read
+	//   compressed bytes from disk.
+	// - 1/3 for buffered reads after decompression. Kept separate from the write
+	//   memory to allow for Enqueues to come in while unread batches are held in
+	//   memory.
+	// In this mode, Enqueues and Dequeues may happen in any order.
+	DiskQueueCacheModeDefault DiskQueueCacheMode = iota
+	// DiskQueueCacheModeReuseCache imposes a limitation that all Enqueues happen
+	// before all Dequeues to be able to reuse more memory. In this mode the cache
+	// will be divided as follows:
+	// - 1/2 for buffered writes and buffered reads.
+	// - 1/2 for compressed write and reads (given the limitation that this memory
+	//   has to be non-overlapping.
+	DiskQueueCacheModeReuseCache
+	// DiskQueueCacheModeClearAndReuseCache is the same as
+	// DiskQueueCacheModeReuseCache with the additional behavior that when a
+	// coldata.ZeroBatch is Enqueued, the cache will be released to the GC.
+	DiskQueueCacheModeClearAndReuseCache
 )
 
 // DiskQueueCfg is a struct holding the configuration options for a DiskQueue.
@@ -211,12 +260,19 @@ type DiskQueueCfg struct {
 	// Path is where the temporary directory that will contain this DiskQueue's
 	// files should be created. The directory name will be a UUID.
 	Path string
+	// CacheMode defines the way a DiskQueue should use its cache. Refer to the
+	// comment of DiskQueueCacheModes for more information.
+	CacheMode DiskQueueCacheMode
 	// BufferSizeBytes is the number of bytes to buffer before compressing and
 	// writing to disk.
 	BufferSizeBytes int
 	// MaxFileSizeBytes is the maximum size an on-disk file should reach before
 	// rolling over to a new one.
 	MaxFileSizeBytes int
+
+	// OnNewDiskQueueCb is an optional callback function that will be called when
+	// NewDiskQueue is called.
+	OnNewDiskQueueCb func()
 
 	// TestingKnobs are used to test the queue implementation.
 	TestingKnobs struct {
@@ -234,12 +290,22 @@ func (cfg *DiskQueueCfg) EnsureDefaults() error {
 		return errors.New("FS unset on DiskQueueCfg")
 	}
 	if cfg.BufferSizeBytes == 0 {
-		cfg.BufferSizeBytes = defaultBufferSizeBytes
+		cfg.SetDefaultBufferSizeBytesForCacheMode()
 	}
 	if cfg.MaxFileSizeBytes == 0 {
 		cfg.MaxFileSizeBytes = defaultMaxFileSizeBytes
 	}
 	return nil
+}
+
+// SetDefaultBufferSizeBytesForCacheMode sets the default BufferSizeBytes
+// according to the set CacheMode.
+func (cfg *DiskQueueCfg) SetDefaultBufferSizeBytesForCacheMode() {
+	if cfg.CacheMode == DiskQueueCacheModeDefault {
+		cfg.BufferSizeBytes = defaultBufferSizeBytesDefaultCacheMode
+	} else {
+		cfg.BufferSizeBytes = defaultBufferSizeBytesReuseCacheMode
+	}
 }
 
 // NewDiskQueue creates a Queue that spills to disk.
@@ -248,17 +314,36 @@ func NewDiskQueue(typs []coltypes.T, cfg DiskQueueCfg) (Queue, error) {
 	if err := cfg.EnsureDefaults(); err != nil {
 		return nil, err
 	}
+	if cfg.OnNewDiskQueueCb != nil {
+		cfg.OnNewDiskQueueCb()
+	}
 	d := &diskQueue{
-		dirName: uuid.FastMakeV4().String(),
-		typs:    typs,
-		cfg:     cfg,
-		files:   make([]file, 0, 4),
+		dirName:          uuid.FastMakeV4().String(),
+		typs:             typs,
+		cfg:              cfg,
+		files:            make([]file, 0, 4),
+		writeBufferLimit: cfg.BufferSizeBytes / 3,
+	}
+	// Refer to the DiskQueueCacheMode comment for why this division of
+	// BufferSizeBytes.
+	if d.cfg.CacheMode != DiskQueueCacheModeDefault {
+		d.writeBufferLimit = d.cfg.BufferSizeBytes / 2
 	}
 	if err := cfg.FS.CreateDir(filepath.Join(cfg.Path, d.dirName)); err != nil {
 		return nil, err
 	}
 	// rotateFile will create a new file to write to.
 	return d, d.rotateFile()
+}
+
+func (d *diskQueue) CloseRead() error {
+	if d.readFile != nil {
+		if err := d.readFile.Close(); err != nil {
+			return err
+		}
+		d.readFile = nil
+	}
+	return nil
 }
 
 func (d *diskQueue) Close() error {
@@ -280,14 +365,11 @@ func (d *diskQueue) Close() error {
 		}
 		d.writeFile = nil
 	}
-	if d.readFile != nil {
-		if err := d.readFile.Close(); err != nil {
-			return err
-		}
-		d.readFile = nil
-		// The readFile will be removed below in RemoveAll.
+	// The readFile will be removed below in DeleteDirAndFiles.
+	if err := d.CloseRead(); err != nil {
+		return err
 	}
-	if err := d.cfg.FS.DeleteDir(filepath.Join(d.cfg.Path, d.dirName)); err != nil {
+	if err := d.cfg.FS.DeleteDirAndFiles(filepath.Join(d.cfg.Path, d.dirName)); err != nil {
 		return err
 	}
 	return nil
@@ -358,7 +440,15 @@ func (d *diskQueue) writeFooterAndFlush() error {
 }
 
 func (d *diskQueue) Enqueue(b coldata.Batch) error {
+	if d.state == diskQueueStateDequeueing && d.cfg.CacheMode != DiskQueueCacheModeDefault {
+		return errors.Errorf("attempted to Enqueue to DiskQueue in mode that disallows it: %d", d.cfg.CacheMode)
+	}
+	d.state = diskQueueStateEnqueueing
 	if b.Length() == 0 {
+		if d.done {
+			// Already done.
+			return nil
+		}
 		if err := d.writeFooterAndFlush(); err != nil {
 			return err
 		}
@@ -372,6 +462,14 @@ func (d *diskQueue) Enqueue(b coldata.Batch) error {
 		d.serializer = nil
 		// The write file will be closed in Close.
 		d.done = true
+		if d.cfg.CacheMode == DiskQueueCacheModeClearAndReuseCache {
+			// Clear the cache. d.scratchDecompressedReadBytes should already be nil
+			// since we don't allow writes once reads happen in this mode.
+			d.scratchDecompressedReadBytes = nil
+			// Clear the write side of the cache.
+			d.writer.buffer = bytes.Buffer{}
+			d.writer.scratch.compressedBuf = nil
+		}
 		return nil
 	}
 	if err := d.serializer.AppendBatch(b); err != nil {
@@ -379,11 +477,7 @@ func (d *diskQueue) Enqueue(b coldata.Batch) error {
 	}
 	d.numBufferedBatches++
 
-	// Only buffer up to a third of the available buffer space, we need another
-	// third to compress these reads and buffer compressed writes, as well as a
-	// final third to buffer decompressed reads. Refer to the diskQueue struct
-	// comment for a more thorough explanation of this space division.
-	bufferSizeLimitReached := d.writer.numBytesBuffered() > d.cfg.BufferSizeBytes/3
+	bufferSizeLimitReached := d.writer.numBytesBuffered() > d.writeBufferLimit
 	fileSizeLimitReached := d.files[d.writeFileIdx].totalSize+d.writer.numBytesBuffered() > d.cfg.MaxFileSizeBytes
 	if bufferSizeLimitReached || fileSizeLimitReached {
 		if fileSizeLimitReached {
@@ -414,7 +508,7 @@ func (d *diskQueue) maybeInitDeserializer() (bool, error) {
 		// writer has rotated to a new file.
 		if fileToRead.finishedWriting {
 			// Close and remove current file.
-			if err := d.readFile.Close(); err != nil {
+			if err := d.CloseRead(); err != nil {
 				return false, err
 			}
 			if err := d.cfg.FS.DeleteFile(d.files[d.readFileIdx].name); err != nil {
@@ -509,6 +603,15 @@ func (d *diskQueue) Dequeue(b coldata.Batch) (bool, error) {
 			return false, err
 		}
 	}
+	if d.state == diskQueueStateEnqueueing && d.cfg.CacheMode != DiskQueueCacheModeDefault {
+		// This is the first Dequeue after Enqueues, so reuse the write cache for
+		// reads. Note that the buffer for compressed reads is reused in
+		// maybeInitDeserializer in either case, so there is nothing to do here for
+		// that.
+		d.writer.buffer.Reset()
+		d.scratchDecompressedReadBytes = d.writer.buffer.Bytes()
+	}
+	d.state = diskQueueStateDequeueing
 
 	if d.deserializerState.FileDeserializer != nil && d.deserializerState.curBatch >= d.deserializerState.NumBatches() {
 		// Finished all the batches, set the deserializer to nil to initialize a new

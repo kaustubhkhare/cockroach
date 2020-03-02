@@ -144,7 +144,7 @@ type MVCCIterator interface {
 	// alternating from key to value, where numKVs specifies the number of pairs
 	// in the buffer.
 	MVCCScan(
-		start, end roachpb.Key, max int64, timestamp hlc.Timestamp, opts MVCCScanOptions,
+		start, end roachpb.Key, timestamp hlc.Timestamp, opts MVCCScanOptions,
 	) (MVCCScanResult, error)
 }
 
@@ -349,10 +349,6 @@ type Engine interface {
 	GetCompactionStats() string
 	// GetStats retrieves stats from the engine.
 	GetStats() (*Stats, error)
-	// GetTickersAndHistograms retrieves maps of all RocksDB tickers and histograms.
-	// It differs from `GetStats` by getting _every_ ticker and histogram, and by not
-	// getting anything else (DB properties, for example).
-	GetTickersAndHistograms() (*enginepb.TickersAndHistograms, error)
 	// GetEncryptionRegistries returns the file and key registries when encryption is enabled
 	// on the store.
 	GetEncryptionRegistries() (*EncryptionRegistries, error)
@@ -421,10 +417,6 @@ type Engine interface {
 	ReadFile(filename string) ([]byte, error)
 	// WriteFile writes data to a file in this RocksDB's env.
 	WriteFile(filename string, data []byte) error
-	// DeleteDirAndFiles deletes the directory and any files it contains but
-	// not subdirectories from this RocksDB's env. If dir does not exist,
-	// DeleteDirAndFiles returns nil (no error).
-	DeleteDirAndFiles(dir string) error
 	// CreateCheckpoint creates a checkpoint of the engine in the given directory,
 	// which must not exist. The directory should be on the same file system so
 	// that hard links can be used.

@@ -49,8 +49,9 @@ import (
 
 var (
 	// ErrIntOutOfRange is reported when integer arithmetic overflows.
-	ErrIntOutOfRange   = pgerror.New(pgcode.NumericValueOutOfRange, "integer out of range")
-	errFloatOutOfRange = pgerror.New(pgcode.NumericValueOutOfRange, "float out of range")
+	ErrIntOutOfRange = pgerror.New(pgcode.NumericValueOutOfRange, "integer out of range")
+	// ErrFloatOutOfRange is reported when float arithmetic overflows.
+	ErrFloatOutOfRange = pgerror.New(pgcode.NumericValueOutOfRange, "float out of range")
 	errDecOutOfRange   = pgerror.New(pgcode.NumericValueOutOfRange, "decimal out of range")
 
 	// ErrDivByZero is reported on a division by zero.
@@ -3018,7 +3019,7 @@ func (ctx *EvalContext) SetStmtTimestamp(ts time.Time) {
 
 // GetLocation returns the session timezone.
 func (ctx *EvalContext) GetLocation() *time.Location {
-	if ctx.SessionData.DataConversion.Location == nil {
+	if ctx.SessionData == nil || ctx.SessionData.DataConversion.Location == nil {
 		return time.UTC
 	}
 	return ctx.SessionData.DataConversion.Location
@@ -3363,7 +3364,7 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 		case *DDecimal:
 			f, err := v.Float64()
 			if err != nil {
-				return nil, errFloatOutOfRange
+				return nil, ErrFloatOutOfRange
 			}
 			return NewDFloat(DFloat(f)), nil
 		case *DString:
@@ -3379,7 +3380,7 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 		case *DDate:
 			// TODO(mjibson): This cast is unsupported by postgres. Should we remove ours?
 			if !v.IsFinite() {
-				return nil, errFloatOutOfRange
+				return nil, ErrFloatOutOfRange
 			}
 			return NewDFloat(DFloat(float64(v.UnixEpochDays()))), nil
 		case *DInterval:

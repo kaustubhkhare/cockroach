@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/abortspan"
+	"github.com/cockroachdb/cockroach/pkg/storage/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
@@ -42,7 +43,9 @@ const (
 	IntentAgeThreshold = 2 * time.Hour // 2 hour
 
 	// KeyVersionChunkBytes is the threshold size for splitting
-	// GCRequests into multiple batches.
+	// GCRequests into multiple batches. The goal is that the evaluated
+	// Raft command for each GCRequest does not significantly exceed
+	// this threshold.
 	KeyVersionChunkBytes = base.ChunkRaftCommandThresholdBytes
 )
 
@@ -60,10 +63,20 @@ func TimestampForThreshold(threshold hlc.Timestamp, policy zonepb.GCPolicy) (ts 
 	return threshold.Add(ttlNanos, 0)
 }
 
+// Thresholder is part of the GCer interface.
+type Thresholder interface {
+	SetGCThreshold(context.Context, Threshold) error
+}
+
+// PureGCer is part of the GCer interface.
+type PureGCer interface {
+	GC(context.Context, []roachpb.GCRequest_GCKey) error
+}
+
 // A GCer is an abstraction used by the GC queue to carry out chunked deletions.
 type GCer interface {
-	SetGCThreshold(context.Context, Threshold) error
-	GC(context.Context, []roachpb.GCRequest_GCKey) error
+	Thresholder
+	PureGCer
 }
 
 // NoopGCer implements GCer by doing nothing.
@@ -134,7 +147,7 @@ type CleanupIntentsFunc func(context.Context, []roachpb.Intent) error
 // transaction record, pushing the transaction first if it is
 // PENDING. Once all intents are resolved successfully, removes the
 // transaction record.
-type CleanupTxnIntentsAsyncFunc func(context.Context, *roachpb.Transaction, []roachpb.Intent) error
+type CleanupTxnIntentsAsyncFunc func(context.Context, *roachpb.Transaction, []roachpb.LockUpdate) error
 
 // Run runs garbage collection for the specified descriptor on the
 // provided Engine (which is not mutated). It uses the provided gcFn
@@ -169,37 +182,29 @@ func Run(
 
 	// Maps from txn ID to txn and intent key slice.
 	txnMap := map[uuid.UUID]*roachpb.Transaction{}
-	intentSpanMap := map[uuid.UUID][]roachpb.Span{}
-	err := processReplicatedKeyRange(ctx, desc, snap, now, newThreshold, gcer, txnMap, intentSpanMap, &info)
+	intentKeyMap := map[uuid.UUID][]roachpb.Key{}
+	err := processReplicatedKeyRange(ctx, desc, snap, now, newThreshold, gcer, txnMap, intentKeyMap, &info)
 	if err != nil {
 		return Info{}, err
 	}
 
-	// From now on, all newly added keys are range-local.
+	// From now on, all keys processed are range-local and inline (zero timestamp).
 
 	// Process local range key entries (txn records, queue last processed times).
-	localRangeKeys, err := processLocalKeyRange(ctx, snap, desc, txnExp, &info, cleanupTxnIntentsAsyncFn)
-	if err != nil {
-		return Info{}, err
-	}
-
-	if err := gcer.GC(ctx, localRangeKeys); err != nil {
-		return Info{}, err
+	if err := processLocalKeyRange(ctx, snap, desc, txnExp, &info, cleanupTxnIntentsAsyncFn, gcer); err != nil {
+		log.Warningf(ctx, "while gc'ing local key range: %s", err)
 	}
 
 	// Clean up the AbortSpan.
 	log.Event(ctx, "processing AbortSpan")
-	abortSpanKeys := processAbortSpan(ctx, snap, desc.RangeID, txnExp, &info)
-	if err := gcer.GC(ctx, abortSpanKeys); err != nil {
-		return Info{}, err
-	}
+	processAbortSpan(ctx, snap, desc.RangeID, txnExp, &info, gcer)
 
 	log.Eventf(ctx, "GC'ed keys; stats %+v", info)
 
 	// Push transactions (if pending) and resolve intents.
 	var intents []roachpb.Intent
 	for txnID, txn := range txnMap {
-		intents = append(intents, roachpb.AsIntents(intentSpanMap[txnID], txn)...)
+		intents = append(intents, roachpb.AsIntents(&txn.TxnMeta, intentKeyMap[txnID])...)
 	}
 	info.ResolveTotal += len(intents)
 	log.Eventf(ctx, "cleanup of %d intents", len(intents))
@@ -214,7 +219,7 @@ func Run(
 // remove it.
 //
 // The logic iterates all versions of all keys in the range from oldest to
-// newest. Expired intents are written into the txnMap and intentSpanMap.
+// newest. Expired intents are written into the txnMap and intentKeyMap.
 func processReplicatedKeyRange(
 	ctx context.Context,
 	desc *roachpb.RangeDescriptor,
@@ -223,7 +228,7 @@ func processReplicatedKeyRange(
 	threshold hlc.Timestamp,
 	gcer GCer,
 	txnMap map[uuid.UUID]*roachpb.Transaction,
-	intentSpanMap map[uuid.UUID][]roachpb.Span,
+	intentKeyMap map[uuid.UUID][]roachpb.Key,
 	info *Info,
 ) error {
 	var alloc bufalloc.ByteAllocator
@@ -257,9 +262,7 @@ func processReplicatedKeyRange(
 				}
 				info.IntentsConsidered++
 				alloc, md.Key.Key = alloc.Copy(md.Key.Key, 0)
-				intentSpanMap[txnID] = append(intentSpanMap[txnID], roachpb.Span{
-					Key: md.Key.Key,
-				})
+				intentKeyMap[txnID] = append(intentKeyMap[txnID], md.Key.Key)
 			}
 		}
 	}
@@ -399,16 +402,20 @@ func processLocalKeyRange(
 	cutoff hlc.Timestamp,
 	info *Info,
 	cleanupTxnIntentsAsyncFn CleanupTxnIntentsAsyncFunc,
-) ([]roachpb.GCRequest_GCKey, error) {
-	var gcKeys []roachpb.GCRequest_GCKey
+	gcer PureGCer,
+) error {
+	b := makeBatchingInlineGCer(gcer, func(err error) {
+		log.Warningf(ctx, "failed to GC from local key range: %s", err)
+	})
+	defer b.Flush(ctx)
 
 	handleTxnIntents := func(key roachpb.Key, txn *roachpb.Transaction) error {
 		// If the transaction needs to be pushed or there are intents to
 		// resolve, invoke the cleanup function.
 		if !txn.Status.IsFinalized() || len(txn.IntentSpans) > 0 {
-			return cleanupTxnIntentsAsyncFn(ctx, txn, roachpb.AsIntents(txn.IntentSpans, txn))
+			return cleanupTxnIntentsAsyncFn(ctx, txn, roachpb.AsLockUpdates(txn, txn.IntentSpans, lock.Replicated))
 		}
-		gcKeys = append(gcKeys, roachpb.GCRequest_GCKey{Key: key}) // zero timestamp
+		b.FlushingAdd(ctx, key)
 		return nil
 	}
 
@@ -441,7 +448,7 @@ func processLocalKeyRange(
 	handleOneQueueLastProcessed := func(kv roachpb.KeyValue, rangeKey roachpb.RKey) error {
 		if !rangeKey.Equal(desc.StartKey) {
 			// Garbage collect the last processed timestamp if it doesn't match start key.
-			gcKeys = append(gcKeys, roachpb.GCRequest_GCKey{Key: kv.Key}) // zero timestamp
+			b.FlushingAdd(ctx, kv.Key)
 		}
 		return nil
 	}
@@ -470,7 +477,7 @@ func processLocalKeyRange(
 		func(kv roachpb.KeyValue) (bool, error) {
 			return false, handleOne(kv)
 		})
-	return gcKeys, err
+	return err
 }
 
 // processAbortSpan iterates through the local AbortSpan entries
@@ -484,19 +491,56 @@ func processAbortSpan(
 	rangeID roachpb.RangeID,
 	threshold hlc.Timestamp,
 	info *Info,
-) []roachpb.GCRequest_GCKey {
-	var gcKeys []roachpb.GCRequest_GCKey
+	gcer PureGCer,
+) {
+	b := makeBatchingInlineGCer(gcer, func(err error) {
+		log.Warningf(ctx, "unable to GC from abort span: %s", err)
+	})
+	defer b.Flush(ctx)
 	abortSpan := abortspan.New(rangeID)
-	if err := abortSpan.Iterate(ctx, snap, func(key roachpb.Key, v roachpb.AbortSpanEntry) error {
+	err := abortSpan.Iterate(ctx, snap, func(key roachpb.Key, v roachpb.AbortSpanEntry) error {
 		info.AbortSpanTotal++
 		if v.Timestamp.Less(threshold) {
 			info.AbortSpanGCNum++
-			gcKeys = append(gcKeys, roachpb.GCRequest_GCKey{Key: key})
+			b.FlushingAdd(ctx, key)
 		}
 		return nil
-	}); err != nil {
-		// Still return whatever we managed to collect.
+	})
+	if err != nil {
 		log.Warning(ctx, err)
 	}
-	return gcKeys
+}
+
+// batchingInlineGCer is a helper to paginate the GC of inline (i.e. zero
+// timestamp keys). After creation, keys are added via FlushingAdd(). A
+// final call to Flush() empties out the buffer when all keys were added.
+type batchingInlineGCer struct {
+	gcer  PureGCer
+	onErr func(error)
+
+	size   int
+	max    int
+	gcKeys []roachpb.GCRequest_GCKey
+}
+
+func makeBatchingInlineGCer(gcer PureGCer, onErr func(error)) batchingInlineGCer {
+	return batchingInlineGCer{gcer: gcer, onErr: onErr, max: KeyVersionChunkBytes}
+}
+
+func (b *batchingInlineGCer) FlushingAdd(ctx context.Context, key roachpb.Key) {
+	b.gcKeys = append(b.gcKeys, roachpb.GCRequest_GCKey{Key: key})
+	b.size += len(key)
+	if b.size < b.max {
+		return
+	}
+	b.Flush(ctx)
+}
+
+func (b *batchingInlineGCer) Flush(ctx context.Context) {
+	err := b.gcer.GC(ctx, b.gcKeys)
+	b.gcKeys = nil
+	b.size = 0
+	if err != nil {
+		b.onErr(err)
+	}
 }

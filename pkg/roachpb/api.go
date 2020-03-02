@@ -15,6 +15,7 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/cockroachdb/cockroach/pkg/storage/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/pkg/errors"
 )
@@ -231,6 +232,7 @@ func (rh *ResponseHeader) combine(otherRH ResponseHeader) error {
 	rh.ResumeSpan = otherRH.ResumeSpan
 	rh.ResumeReason = otherRH.ResumeReason
 	rh.NumKeys += otherRH.NumKeys
+	rh.NumBytes += otherRH.NumBytes
 	rh.RangeInfos = append(rh.RangeInfos, otherRH.RangeInfos...)
 	return nil
 }
@@ -1170,12 +1172,24 @@ func InsertRangeInfo(ris []RangeInfo, ri RangeInfo) []RangeInfo {
 	return append(ris, ri)
 }
 
+// BulkOpSummaryID returns the key within a BulkOpSummary's EntryCounts map for
+// the given table and index ID. This logic is mirrored in c++ in rowcounter.cc.
+func BulkOpSummaryID(tableID, indexID uint64) uint64 {
+	return (tableID << 32) | indexID
+}
+
 // Add combines the values from other, for use on an accumulator BulkOpSummary.
 func (b *BulkOpSummary) Add(other BulkOpSummary) {
 	b.DataSize += other.DataSize
-	b.Rows += other.Rows
-	b.IndexEntries += other.IndexEntries
-	b.SystemRecords += other.SystemRecords
+	b.DeprecatedRows += other.DeprecatedRows
+	b.DeprecatedIndexEntries += other.DeprecatedIndexEntries
+
+	if other.EntryCounts != nil && b.EntryCounts == nil {
+		b.EntryCounts = make(map[uint64]int64, len(other.EntryCounts))
+	}
+	for i := range other.EntryCounts {
+		b.EntryCounts[i] += other.EntryCounts[i]
+	}
 }
 
 // MustSetValue is like SetValue, except it resets the enum and panics if the
@@ -1272,23 +1286,26 @@ func (acrr *AdminChangeReplicasRequest) Changes() []ReplicationChange {
 	return sl
 }
 
-// AsIntent creates an intent corresponding to the given resolve intent request.
-func (rir *ResolveIntentRequest) AsIntent() Intent {
-	return Intent{
+// AsLockUpdate creates a lock update message corresponding to the given resolve
+// intent request.
+func (rir *ResolveIntentRequest) AsLockUpdate() LockUpdate {
+	return LockUpdate{
 		Span:           rir.Span(),
 		Txn:            rir.IntentTxn,
 		Status:         rir.Status,
 		IgnoredSeqNums: rir.IgnoredSeqNums,
+		Durability:     lock.Replicated,
 	}
 }
 
-// AsIntent creates an intent corresponding to the given resolve
+// AsLockUpdate creates a lock update message corresponding to the given resolve
 // intent range request.
-func (rirr *ResolveIntentRangeRequest) AsIntent() Intent {
-	return Intent{
+func (rirr *ResolveIntentRangeRequest) AsLockUpdate() LockUpdate {
+	return LockUpdate{
 		Span:           rirr.Span(),
 		Txn:            rirr.IntentTxn,
 		Status:         rirr.Status,
 		IgnoredSeqNums: rirr.IgnoredSeqNums,
+		Durability:     lock.Replicated,
 	}
 }

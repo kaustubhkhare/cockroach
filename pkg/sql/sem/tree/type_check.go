@@ -1019,15 +1019,13 @@ func (expr *NotExpr) TypeCheck(ctx *SemaContext, desired *types.T) (TypedExpr, e
 
 // TypeCheck implements the Expr interface.
 func (expr *NullIfExpr) TypeCheck(ctx *SemaContext, desired *types.T) (TypedExpr, error) {
-	typedSubExprs, _, err := TypeCheckSameTypedExprs(ctx, desired, expr.Expr1, expr.Expr2)
+	typedSubExprs, retType, err := TypeCheckSameTypedExprs(ctx, desired, expr.Expr1, expr.Expr2)
 	if err != nil {
 		return nil, decorateTypeCheckError(err, "incompatible NULLIF expressions")
 	}
 
 	expr.Expr1, expr.Expr2 = typedSubExprs[0], typedSubExprs[1]
-
-	// The return type of NULLIF is the type of the first expression.
-	expr.typ = typedSubExprs[0].ResolvedType()
+	expr.typ = retType
 	return expr, nil
 }
 
@@ -1713,10 +1711,14 @@ func typeCheckComparisonOp(
 	}
 	leftReturn := leftExpr.ResolvedType()
 	rightReturn := rightExpr.ResolvedType()
+	leftFamily := leftReturn.Family()
+	rightFamily := rightReturn.Family()
 
 	// Return early if at least one overload is possible, NULL is an argument,
 	// and none of the overloads accept NULL.
-	if leftReturn.Family() == types.UnknownFamily || rightReturn.Family() == types.UnknownFamily {
+	nullComparison := false
+	if leftFamily == types.UnknownFamily || rightFamily == types.UnknownFamily {
+		nullComparison = true
 		if len(fns) > 0 {
 			noneAcceptNull := true
 			for _, e := range fns {
@@ -1731,13 +1733,23 @@ func typeCheckComparisonOp(
 		}
 	}
 
+	leftIsGeneric := leftFamily == types.CollatedStringFamily || leftFamily == types.ArrayFamily
+	rightIsGeneric := rightFamily == types.CollatedStringFamily || rightFamily == types.ArrayFamily
+	genericComparison := leftIsGeneric && rightIsGeneric
+
+	typeMismatch := false
+	if genericComparison && !nullComparison {
+		// A generic comparison (one between two generic types, like arrays) is not
+		// well-typed if the two input types are not equivalent, unless one of the
+		// sides is NULL.
+		typeMismatch = !leftReturn.Equivalent(rightReturn)
+	}
+
 	// Throw a typing error if overload resolution found either no compatible candidates
 	// or if it found an ambiguity.
-	collationMismatch :=
-		leftReturn.Family() == types.CollatedStringFamily && !leftReturn.Equivalent(rightReturn)
-	if len(fns) != 1 || collationMismatch {
+	if len(fns) != 1 || typeMismatch {
 		sig := fmt.Sprintf(compSignatureFmt, leftReturn, op, rightReturn)
-		if len(fns) == 0 || collationMismatch {
+		if len(fns) == 0 || typeMismatch {
 			return nil, nil, nil, false,
 				pgerror.Newf(pgcode.InvalidParameterValue, unsupportedCompErrFmt, sig)
 		}

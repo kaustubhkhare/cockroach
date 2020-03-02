@@ -27,20 +27,20 @@ import (
 )
 
 type mockIntentResolver struct {
-	pushTxn       func(*enginepb.TxnMeta, roachpb.Header, roachpb.PushTxnType) (roachpb.Transaction, *Error)
-	resolveIntent func(roachpb.Intent) *Error
+	pushTxn       func(context.Context, *enginepb.TxnMeta, roachpb.Header, roachpb.PushTxnType) (roachpb.Transaction, *Error)
+	resolveIntent func(context.Context, roachpb.LockUpdate) *Error
 }
 
 func (m *mockIntentResolver) PushTransaction(
-	_ context.Context, txn *enginepb.TxnMeta, h roachpb.Header, pushType roachpb.PushTxnType,
+	ctx context.Context, txn *enginepb.TxnMeta, h roachpb.Header, pushType roachpb.PushTxnType,
 ) (roachpb.Transaction, *Error) {
-	return m.pushTxn(txn, h, pushType)
+	return m.pushTxn(ctx, txn, h, pushType)
 }
 
 func (m *mockIntentResolver) ResolveIntent(
-	_ context.Context, intent roachpb.Intent, _ intentresolver.ResolveOptions,
+	ctx context.Context, intent roachpb.LockUpdate, _ intentresolver.ResolveOptions,
 ) *Error {
-	return m.resolveIntent(intent)
+	return m.resolveIntent(ctx, intent)
 }
 
 type mockLockTableGuard struct {
@@ -270,12 +270,9 @@ func testWaitPush(t *testing.T, k stateKind, makeReq func() Request, expPushTS h
 				txn:         &pusheeTxn.TxnMeta,
 				ts:          pusheeTxn.WriteTimestamp,
 				key:         keyA,
-				held:        false,
+				held:        lockHeld,
 				access:      spanset.SpanReadWrite,
 				guardAccess: spanset.SpanReadOnly,
-			}
-			if lockHeld {
-				g.state.held = true
 			}
 			if waitAsWrite {
 				g.state.guardAccess = spanset.SpanReadWrite
@@ -283,37 +280,62 @@ func testWaitPush(t *testing.T, k stateKind, makeReq func() Request, expPushTS h
 			g.notify()
 
 			req := makeReq()
-			ir.pushTxn = func(
-				pusheeArg *enginepb.TxnMeta, h roachpb.Header, pushType roachpb.PushTxnType,
-			) (roachpb.Transaction, *Error) {
-				require.Equal(t, &pusheeTxn.TxnMeta, pusheeArg)
-				require.Equal(t, req.Txn, h.Txn)
-				require.Equal(t, expPushTS, h.Timestamp)
-				if waitAsWrite {
-					require.Equal(t, roachpb.PUSH_ABORT, pushType)
-				} else {
-					require.Equal(t, roachpb.PUSH_TIMESTAMP, pushType)
-				}
+			if lockHeld {
+				// We expect the holder to be pushed.
+				ir.pushTxn = func(
+					_ context.Context,
+					pusheeArg *enginepb.TxnMeta,
+					h roachpb.Header,
+					pushType roachpb.PushTxnType,
+				) (roachpb.Transaction, *Error) {
+					require.Equal(t, &pusheeTxn.TxnMeta, pusheeArg)
+					require.Equal(t, req.Txn, h.Txn)
+					require.Equal(t, expPushTS, h.Timestamp)
+					if waitAsWrite {
+						require.Equal(t, roachpb.PUSH_ABORT, pushType)
+					} else {
+						require.Equal(t, roachpb.PUSH_TIMESTAMP, pushType)
+					}
 
-				resp := roachpb.Transaction{TxnMeta: *pusheeArg, Status: roachpb.ABORTED}
+					resp := roachpb.Transaction{TxnMeta: *pusheeArg, Status: roachpb.ABORTED}
 
-				// If the lock is held, we'll try to resolve it now that
-				// we know the holder is ABORTED. Otherwide, immediately
-				// tell the request to stop waiting.
-				if lockHeld {
-					ir.resolveIntent = func(intent roachpb.Intent) *Error {
-						require.Equal(t, keyA, intent.Key)
-						require.Equal(t, pusheeTxn.ID, intent.Txn.ID)
-						require.Equal(t, roachpb.ABORTED, intent.Status)
+					// If the lock is held, we'll try to resolve it now that
+					// we know the holder is ABORTED. Otherwide, immediately
+					// tell the request to stop waiting.
+					if lockHeld {
+						ir.resolveIntent = func(_ context.Context, intent roachpb.LockUpdate) *Error {
+							require.Equal(t, keyA, intent.Key)
+							require.Equal(t, pusheeTxn.ID, intent.Txn.ID)
+							require.Equal(t, roachpb.ABORTED, intent.Status)
+							g.state = waitingState{stateKind: doneWaiting}
+							g.notify()
+							return nil
+						}
+					} else {
 						g.state = waitingState{stateKind: doneWaiting}
 						g.notify()
-						return nil
 					}
-				} else {
-					g.state = waitingState{stateKind: doneWaiting}
-					g.notify()
+					return resp, nil
 				}
-				return resp, nil
+			} else {
+				switch k {
+				case waitFor, waitForDistinguished:
+					// We don't expect the holder to be pushed. Set up an observer
+					// channel to detect when the current waiting state is observed.
+					g.stateObserved = make(chan struct{})
+					go func() {
+						<-g.stateObserved
+						g.notify()
+						<-g.stateObserved
+						g.state = waitingState{stateKind: doneWaiting}
+						g.notify()
+						<-g.stateObserved
+					}()
+				case waitElsewhere:
+					// Expect an immediate return.
+				default:
+					t.Fatalf("unexpected state: %v", k)
+				}
 			}
 
 			err := w.WaitOn(ctx, req, g)
@@ -354,7 +376,7 @@ func TestLockTableWaiterIntentResolverError(t *testing.T) {
 	// Errors are propagated when observed while pushing transactions.
 	g.notify()
 	ir.pushTxn = func(
-		_ *enginepb.TxnMeta, _ roachpb.Header, _ roachpb.PushTxnType,
+		_ context.Context, _ *enginepb.TxnMeta, _ roachpb.Header, _ roachpb.PushTxnType,
 	) (roachpb.Transaction, *Error) {
 		return roachpb.Transaction{}, err1
 	}
@@ -364,11 +386,11 @@ func TestLockTableWaiterIntentResolverError(t *testing.T) {
 	// Errors are propagated when observed while resolving intents.
 	g.notify()
 	ir.pushTxn = func(
-		_ *enginepb.TxnMeta, _ roachpb.Header, _ roachpb.PushTxnType,
+		_ context.Context, _ *enginepb.TxnMeta, _ roachpb.Header, _ roachpb.PushTxnType,
 	) (roachpb.Transaction, *Error) {
 		return roachpb.Transaction{}, nil
 	}
-	ir.resolveIntent = func(intent roachpb.Intent) *Error {
+	ir.resolveIntent = func(_ context.Context, intent roachpb.LockUpdate) *Error {
 		return err2
 	}
 	err = w.WaitOn(ctx, req, g)

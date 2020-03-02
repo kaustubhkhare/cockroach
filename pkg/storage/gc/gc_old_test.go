@@ -82,7 +82,7 @@ func runGCOld(
 
 	// Maps from txn ID to txn and intent key slice.
 	txnMap := map[uuid.UUID]*roachpb.Transaction{}
-	intentSpanMap := map[uuid.UUID][]roachpb.Span{}
+	intentKeyMap := map[uuid.UUID][]roachpb.Key{}
 
 	// processKeysAndValues is invoked with each key and its set of
 	// values. Intents older than the intent age threshold are sent for
@@ -119,7 +119,7 @@ func runGCOld(
 							info.PushTxn++
 						}
 						info.IntentsConsidered++
-						intentSpanMap[txnID] = append(intentSpanMap[txnID], roachpb.Span{Key: expBaseKey})
+						intentKeyMap[txnID] = append(intentKeyMap[txnID], expBaseKey)
 					}
 					// With an active intent, GC ignores MVCC metadata & intent value.
 					startIdx = 2
@@ -213,31 +213,23 @@ func runGCOld(
 		}
 	}
 
-	// From now on, all newly added keys are range-local.
+	// From now on, all keys processed are range-local.
 
 	// Process local range key entries (txn records, queue last processed times).
-	localRangeKeys, err := processLocalKeyRange(ctx, snap, desc, txnExp, &info, cleanupTxnIntentsAsyncFn)
-	if err != nil {
-		return Info{}, err
-	}
-
-	if err := gcer.GC(ctx, localRangeKeys); err != nil {
-		return Info{}, err
+	if err := processLocalKeyRange(ctx, snap, desc, txnExp, &info, cleanupTxnIntentsAsyncFn, gcer); err != nil {
+		log.Warningf(ctx, "while gc'ing local key range: %s", err)
 	}
 
 	// Clean up the AbortSpan.
 	log.Event(ctx, "processing AbortSpan")
-	abortSpanKeys := processAbortSpan(ctx, snap, desc.RangeID, txnExp, &info)
-	if err := gcer.GC(ctx, abortSpanKeys); err != nil {
-		return Info{}, err
-	}
+	processAbortSpan(ctx, snap, desc.RangeID, txnExp, &info, gcer)
 
 	log.Eventf(ctx, "GC'ed keys; stats %+v", info)
 
 	// Push transactions (if pending) and resolve intents.
 	var intents []roachpb.Intent
 	for txnID, txn := range txnMap {
-		intents = append(intents, roachpb.AsIntents(intentSpanMap[txnID], txn)...)
+		intents = append(intents, roachpb.AsIntents(&txn.TxnMeta, intentKeyMap[txnID])...)
 	}
 	info.ResolveTotal += len(intents)
 	log.Eventf(ctx, "cleanup of %d intents", len(intents))

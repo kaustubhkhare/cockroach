@@ -36,23 +36,29 @@ describe("Nodes Overview page", () => {
       {
         "key": "us-east1",
         "region": "us-east1",
+        "tiers": [
+          { "key": "region", "value": "us-west"},
+          { "key": "az", "value": "us-west-01"},
+        ],
         "nodesCount": 3,
         "replicas": 224,
         "usedCapacity": 0,
         "availableCapacity": 1610612736,
         "usedMemory": 1904611328,
+        "numCpus": 48,
         "availableMemory": 51539607552,
         "status": 6,
         "children": [
           {
             "key": "us-east1-0",
             "nodeId": 1,
-            "region": "us-east1",
+            "nodeName": "127.0.0.1:50945",
             "uptime": "3 minutes",
             "replicas": 78,
             "usedCapacity": 0,
             "availableCapacity": 536870912,
             "usedMemory": 639758336,
+            "numCpus": 16,
             "availableMemory": 17179869184,
             "version": "v20.1.0-alpha.20191118-1798-g0161286a62-dirty",
             "status": 3,
@@ -60,12 +66,13 @@ describe("Nodes Overview page", () => {
           {
             "key": "us-east1-1",
             "nodeId": 2,
-            "region": "us-east1",
+            "nodeName": "127.0.0.2:50945",
             "uptime": "3 minutes",
             "replicas": 74,
             "usedCapacity": 0,
             "availableCapacity": 536870912,
             "usedMemory": 631373824,
+            "numCpus": 16,
             "availableMemory": 17179869184,
             "version": "v20.1.0-alpha.20191118-1798-g0161286a62-dirty",
             "status": 3,
@@ -73,12 +80,13 @@ describe("Nodes Overview page", () => {
           {
             "key": "us-east1-2",
             "nodeId": 3,
-            "region": "us-east1",
+            "nodeName": "127.0.0.3:50945",
             "uptime": "3 minutes",
             "replicas": 72,
             "usedCapacity": 0,
             "availableCapacity": 536870912,
             "usedMemory": 633479168,
+            "numCpus": 16,
             "availableMemory": 17179869184,
             "version": "v20.1.0-alpha.20191118-1798-g0161286a62-dirty",
             "status": 3,
@@ -88,23 +96,29 @@ describe("Nodes Overview page", () => {
       {
         "key": "us-west1",
         "region": "us-west1",
+        "tiers": [
+          { "key": "region", "value": "us-west"},
+          { "key": "az", "value": "us-west-01"},
+        ],
         "nodesCount": 3,
         "replicas": 229,
         "usedCapacity": 0,
         "availableCapacity": 1610612736,
         "usedMemory": 1913843712,
+        "numCpus": 48,
         "availableMemory": 51539607552,
         "status": 6,
         "children": [
           {
             "key": "us-west1-0",
             "nodeId": 4,
-            "region": "us-west1",
+            "nodeName": "127.0.0.4:50945",
             "uptime": "3 minutes",
             "replicas": 73,
             "usedCapacity": 0,
             "availableCapacity": 536870912,
             "usedMemory": 634728448,
+            "numCpus": 16,
             "availableMemory": 17179869184,
             "version": "v20.1.0-alpha.20191118-1798-g0161286a62-dirty",
             "status": 3,
@@ -112,12 +126,13 @@ describe("Nodes Overview page", () => {
           {
             "key": "us-west1-1",
             "nodeId": 5,
-            "region": "us-west1",
+            "nodeName": "127.0.0.5:50945",
             "uptime": "3 minutes",
             "replicas": 78,
             "usedCapacity": 0,
             "availableCapacity": 536870912,
             "usedMemory": 638218240,
+            "numCpus": 16,
             "availableMemory": 17179869184,
             "version": "v20.1.0-alpha.20191118-1798-g0161286a62-dirty",
             "status": 3,
@@ -125,12 +140,13 @@ describe("Nodes Overview page", () => {
           {
             "key": "us-west1-2",
             "nodeId": 6,
-            "region": "us-west1",
+            "nodeName": "127.0.0.6:50945",
             "uptime": "3 minutes",
             "replicas": 78,
             "usedCapacity": 0,
             "availableCapacity": 536870912,
             "usedMemory": 640897024,
+            "numCpus": 16,
             "availableMemory": 17179869184,
             "version": "v20.1.0-alpha.20191118-1798-g0161286a62-dirty",
             "status": 3,
@@ -140,23 +156,29 @@ describe("Nodes Overview page", () => {
       {
         "key": "europe-west1",
         "region": "europe-west1",
+        "tiers": [
+          { "key": "region", "value": "europe-west1"},
+          { "key": "az", "value": "us-west-01"},
+        ],
         "nodesCount": 3,
         "replicas": 216,
         "usedCapacity": 0,
         "availableCapacity": 1610612736,
         "usedMemory": 1924988928,
+        "numCpus": 48,
         "availableMemory": 51539607552,
         "status": 6,
         "children": [
           {
             "key": "europe-west1-0",
             "nodeId": 7,
-            "region": "europe-west1",
+            "nodeName": "127.0.0.7:50945",
             "uptime": "3 minutes",
             "replicas": 71,
             "usedCapacity": 0,
             "availableCapacity": 536870912,
             "usedMemory": 641097728,
+            "numCpus": 16,
             "availableMemory": 17179869184,
             "version": "v20.1.0-alpha.20191118-1798-g0161286a62-dirty",
             "status": 3,
@@ -164,12 +186,13 @@ describe("Nodes Overview page", () => {
           {
             "key": "europe-west1-1",
             "nodeId": 8,
-            "region": "europe-west1",
+            "nodeName": "127.0.0.8:50945",
             "uptime": "3 minutes",
             "replicas": 74,
             "usedCapacity": 0,
             "availableCapacity": 536870912,
             "usedMemory": 641945600,
+            "numCpus": 16,
             "availableMemory": 17179869184,
             "version": "v20.1.0-alpha.20191118-1798-g0161286a62-dirty",
             "status": 3,
@@ -177,12 +200,13 @@ describe("Nodes Overview page", () => {
           {
             "key": "europe-west1-2",
             "nodeId": 9,
-            "region": "europe-west1",
+            "nodeName": "127.0.0.9:50945",
             "uptime": "3 minutes",
             "replicas": 71,
             "usedCapacity": 0,
             "availableCapacity": 536870912,
             "usedMemory": 641945600,
+            "numCpus": 16,
             "availableMemory": 17179869184,
             "version": "v20.1.0-alpha.20191118-1798-g0161286a62-dirty",
             "status": 3,
@@ -219,6 +243,7 @@ describe("Nodes Overview page", () => {
         "replicas",
         "capacity use",
         "memory use",
+        "cpus",
         "version",
         "status",
         "", // logs column doesn't have header text
@@ -230,7 +255,7 @@ describe("Nodes Overview page", () => {
         (columnName, idx) => assert.equal(columnCells.at(idx).text(), columnName));
     });
 
-    it("doesn't display '# of nodes column' when nodes are in single regions", () => {
+    it("doesn't display 'node count' column when nodes are in single regions", () => {
       const expectedColumns = [
         "nodes",
         // should not be displayed "node count",
@@ -238,6 +263,7 @@ describe("Nodes Overview page", () => {
         "replicas",
         "capacity use",
         "memory use",
+        "cpus",
         "version",
         "status",
         "", // logs column doesn't have header text
@@ -277,7 +303,17 @@ describe("Nodes Overview page", () => {
         nodes: {
           data: times(7).map(idx => (
             {
-              desc: { node_id: idx + 1, locality: {}},
+              desc: {
+                node_id: idx + 1,
+                locality: {
+                  tiers: [
+                    { key: "region", value: "us-west" },
+                  ],
+                },
+                address: {
+                  address_field: `127.0.0.${idx + 1}:50945`,
+                },
+              },
               metrics: {
                 "capacity.used": 0,
                 "capacity.available": 0,
@@ -353,6 +389,14 @@ describe("Nodes Overview page", () => {
           assert.isTrue(expectedDecommissionedNodeIds.some(nodeId => nodeId === record.nodeId));
         });
       });
+
+      it("returns correct node name", () => {
+        const recordsGroupedByRegion = decommissionedNodesTableDataSelector.resultFunc(partitionedNodes, nodeSummary);
+        recordsGroupedByRegion.forEach(record => {
+          const expectedName = `127.0.0.${record.nodeId}:50945`;
+          assert.equal(record.nodeName, expectedName);
+        });
+      });
     });
 
     describe("liveNodesTableDataSelector", () => {
@@ -364,6 +408,14 @@ describe("Nodes Overview page", () => {
         assert.lengthOf(recordsGroupedByRegion[0].children, expectedLiveNodeIds.length);
         recordsGroupedByRegion[0].children.forEach(record => {
           assert.isTrue(expectedLiveNodeIds.some(nodeId => nodeId === record.nodeId));
+        });
+      });
+
+      it("returns correct node name", () => {
+        const recordsGroupedByRegion = liveNodesTableDataSelector.resultFunc(partitionedNodes, nodeSummary);
+        recordsGroupedByRegion[0].children.forEach(record => {
+          const expectedName = `127.0.0.${record.nodeId}:50945`;
+          assert.equal(record.nodeName, expectedName);
         });
       });
     });

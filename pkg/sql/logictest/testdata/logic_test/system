@@ -25,7 +25,11 @@ replication_critical_localities
 replication_stats
 reports_meta
 role_members
+role_options
 settings
+statement_bundle_chunks
+statement_diagnostics
+statement_diagnostics_requests
 table_statistics
 ui
 users
@@ -58,6 +62,10 @@ SELECT id FROM system.descriptor
 30
 31
 32
+33
+34
+35
+36
 50
 51
 52
@@ -308,6 +316,16 @@ system  public  role_members                     root    GRANT
 system  public  role_members                     root    INSERT
 system  public  role_members                     root    SELECT
 system  public  role_members                     root    UPDATE
+system  public  role_options                     admin   DELETE
+system  public  role_options                     admin   GRANT
+system  public  role_options                     admin   INSERT
+system  public  role_options                     admin   SELECT
+system  public  role_options                     admin   UPDATE
+system  public  role_options                     root    DELETE
+system  public  role_options                     root    GRANT
+system  public  role_options                     root    INSERT
+system  public  role_options                     root    SELECT
+system  public  role_options                     root    UPDATE
 system  public  settings                         admin   DELETE
 system  public  settings                         admin   GRANT
 system  public  settings                         admin   INSERT
@@ -318,6 +336,36 @@ system  public  settings                         root    GRANT
 system  public  settings                         root    INSERT
 system  public  settings                         root    SELECT
 system  public  settings                         root    UPDATE
+system  public  statement_bundle_chunks          admin   DELETE
+system  public  statement_bundle_chunks          admin   GRANT
+system  public  statement_bundle_chunks          admin   INSERT
+system  public  statement_bundle_chunks          admin   SELECT
+system  public  statement_bundle_chunks          admin   UPDATE
+system  public  statement_bundle_chunks          root    DELETE
+system  public  statement_bundle_chunks          root    GRANT
+system  public  statement_bundle_chunks          root    INSERT
+system  public  statement_bundle_chunks          root    SELECT
+system  public  statement_bundle_chunks          root    UPDATE
+system  public  statement_diagnostics            admin   DELETE
+system  public  statement_diagnostics            admin   GRANT
+system  public  statement_diagnostics            admin   INSERT
+system  public  statement_diagnostics            admin   SELECT
+system  public  statement_diagnostics            admin   UPDATE
+system  public  statement_diagnostics            root    DELETE
+system  public  statement_diagnostics            root    GRANT
+system  public  statement_diagnostics            root    INSERT
+system  public  statement_diagnostics            root    SELECT
+system  public  statement_diagnostics            root    UPDATE
+system  public  statement_diagnostics_requests   admin   DELETE
+system  public  statement_diagnostics_requests   admin   GRANT
+system  public  statement_diagnostics_requests   admin   INSERT
+system  public  statement_diagnostics_requests   admin   SELECT
+system  public  statement_diagnostics_requests   admin   UPDATE
+system  public  statement_diagnostics_requests   root    DELETE
+system  public  statement_diagnostics_requests   root    GRANT
+system  public  statement_diagnostics_requests   root    INSERT
+system  public  statement_diagnostics_requests   root    SELECT
+system  public  statement_diagnostics_requests   root    UPDATE
 system  public  table_statistics                 admin   DELETE
 system  public  table_statistics                 admin   GRANT
 system  public  table_statistics                 admin   INSERT

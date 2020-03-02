@@ -29,12 +29,7 @@ func DefaultDeclareKeys(
 	} else {
 		access = spanset.SpanReadWrite
 	}
-
-	if keys.IsLocal(req.Header().Span().Key) {
-		spans.AddNonMVCC(access, req.Header().Span())
-	} else {
-		spans.AddMVCC(access, req.Header().Span(), header.Timestamp)
-	}
+	spans.AddMVCC(access, req.Header().Span(), header.Timestamp)
 }
 
 // DeclareKeysForBatch adds all keys that the batch with the provided header
@@ -63,12 +58,6 @@ type CommandArgs struct {
 	EvalCtx EvalContext
 	Header  roachpb.Header
 	Args    roachpb.Request
-
-	// If MaxKeys is non-zero, span requests should limit themselves to
-	// that many keys. Commands using this feature should also set
-	// NumKeys and ResumeSpan in their responses.
-	MaxKeys int64
-
 	// *Stats should be mutated to reflect any writes made by the command.
 	Stats *enginepb.MVCCStats
 }

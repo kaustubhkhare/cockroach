@@ -31,6 +31,7 @@ import (
 
     "github.com/cockroachdb/cockroach/pkg/sql/lex"
     "github.com/cockroachdb/cockroach/pkg/sql/privilege"
+    "github.com/cockroachdb/cockroach/pkg/sql/roleprivilege"
     "github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
     "github.com/cockroachdb/cockroach/pkg/sql/types"
 )
@@ -339,6 +340,12 @@ func (u *sqlSymUnion) privilegeType() privilege.Kind {
 func (u *sqlSymUnion) privilegeList() privilege.List {
     return u.val.(privilege.List)
 }
+func (u *sqlSymUnion) rolePrivilegeType() roleprivilege.Kind {
+    return u.val.(roleprivilege.Kind)
+}
+func (u *sqlSymUnion) rolePrivilegeList() roleprivilege.List {
+    return u.val.(roleprivilege.List)
+}
 func (u *sqlSymUnion) onConflict() *tree.OnConflict {
     return u.val.(*tree.OnConflict)
 }
@@ -526,7 +533,7 @@ func newNameFromStr(s string) *tree.Name {
 %token <str> CHARACTER CHARACTERISTICS CHECK
 %token <str> CLUSTER COALESCE COLLATE COLLATION COLUMN COLUMNS COMMENT COMMIT
 %token <str> COMMITTED COMPACT COMPLETE CONCAT CONFIGURATION CONFIGURATIONS CONFIGURE
-%token <str> CONFLICT CONSTRAINT CONSTRAINTS CONTAINS CONVERSION COPY COVERING CREATE
+%token <str> CONFLICT CONSTRAINT CONSTRAINTS CONTAINS CONVERSION COPY COVERING CREATE CREATEROLE
 %token <str> CROSS CUBE CURRENT CURRENT_CATALOG CURRENT_DATE CURRENT_SCHEMA
 %token <str> CURRENT_ROLE CURRENT_TIME CURRENT_TIMESTAMP
 %token <str> CURRENT_USER CYCLE
@@ -565,7 +572,7 @@ func newNameFromStr(s string) *tree.Name {
 
 %token <str> MATCH MATERIALIZED MERGE MINVALUE MAXVALUE MINUTE MONTH
 
-%token <str> NAN NAME NAMES NATURAL NEXT NO NO_INDEX_JOIN NONE NORMAL
+%token <str> NAN NAME NAMES NATURAL NEXT NO NOCREATEROLE NO_INDEX_JOIN NONE NORMAL
 %token <str> NOT NOTHING NOTNULL NOWAIT NULL NULLIF NULLS NUMERIC
 
 %token <str> OF OFF OFFSET OID OIDS OIDVECTOR ON ONLY OPT OPTION OPTIONS OR
@@ -637,6 +644,7 @@ func newNameFromStr(s string) *tree.Name {
 %type <tree.Statement> alter_user_stmt
 %type <tree.Statement> alter_range_stmt
 %type <tree.Statement> alter_partition_stmt
+%type <tree.Statement> alter_role_stmt
 
 // ALTER RANGE
 %type <tree.Statement> alter_zone_range_stmt
@@ -836,8 +844,7 @@ func newNameFromStr(s string) *tree.Name {
 %type <tree.ReadWriteMode> transaction_read_mode
 
 %type <str> name opt_name opt_name_parens opt_to_savepoint
-%type <str> privilege savepoint_name
-
+%type <str> privilege role_privilege savepoint_name
 %type <tree.Operator> subquery_op
 %type <*tree.UnresolvedName> func_name
 %type <str> opt_collate
@@ -873,7 +880,7 @@ func newNameFromStr(s string) *tree.Name {
 %type <tree.OrderBy> sort_clause opt_sort_clause
 %type <[]*tree.Order> sortby_list
 %type <tree.IndexElemList> index_params create_as_params
-%type <tree.NameList> name_list privilege_list
+%type <tree.NameList> name_list privilege_list role_privilege_list
 %type <[]int32> opt_array_bounds
 %type <tree.From> from_clause
 %type <tree.TableExprs> from_list rowsfrom_list opt_from_list
@@ -915,7 +922,7 @@ func newNameFromStr(s string) *tree.Name {
 %type <bool> opt_using_gin_btree
 
 %type <*tree.Limit> limit_clause offset_clause opt_limit_clause
-%type <tree.Expr> opt_select_fetch_first_value
+%type <tree.Expr> select_fetch_first_value
 %type <empty> row_or_rows
 %type <empty> first_or_next
 
@@ -981,7 +988,8 @@ func newNameFromStr(s string) *tree.Name {
 %type <str> extract_arg
 %type <bool> opt_varying
 
-%type <*tree.NumVal> signed_iconst
+%type <*tree.NumVal> signed_iconst only_signed_iconst
+%type <*tree.NumVal> signed_fconst only_signed_fconst
 %type <int32> iconst32
 %type <int64> signed_iconst64
 %type <int64> iconst64
@@ -1032,6 +1040,7 @@ func newNameFromStr(s string) *tree.Name {
 %type <*tree.TargetList> opt_on_targets_roles
 %type <tree.NameList> for_grantee_clause
 %type <privilege.List> privileges
+%type <roleprivilege.List> role_privileges
 %type <tree.AuditMode> audit_mode
 
 %type <str> relocate_kw
@@ -1138,10 +1147,11 @@ stmt:
 
 // %Help: ALTER
 // %Category: Group
-// %Text: ALTER TABLE, ALTER INDEX, ALTER VIEW, ALTER SEQUENCE, ALTER DATABASE, ALTER USER
+// %Text: ALTER TABLE, ALTER INDEX, ALTER VIEW, ALTER SEQUENCE, ALTER DATABASE, ALTER USER, ALTER ROLE
 alter_stmt:
   alter_ddl_stmt      // help texts in sub-rule
 | alter_user_stmt     // EXTEND WITH HELP: ALTER USER
+| alter_role_stmt
 | ALTER error         // SHOW HELP: ALTER
 
 alter_ddl_stmt:
@@ -2634,7 +2644,7 @@ drop_user_stmt:
 // %Help: DROP ROLE - remove a role
 // %Category: Priv
 // %Text: DROP ROLE [IF EXISTS] <role> [, ...]
-// %SeeAlso: CREATE ROLE, SHOW ROLES
+// %SeeAlso: CREATE ROLE, ALTER ROLE, SHOW ROLES
 drop_role_stmt:
   DROP ROLE string_or_placeholder_list
   {
@@ -3885,7 +3895,7 @@ show_users_stmt:
 // %Help: SHOW ROLES - list defined roles
 // %Category: Priv
 // %Text: SHOW ROLES
-// %SeeAlso: CREATE ROLE, DROP ROLE
+// %SeeAlso: CREATE ROLE, ALTER ROLE, DROP ROLE
 show_roles_stmt:
   SHOW ROLES
   {
@@ -4727,12 +4737,13 @@ constraint_elem:
       },
     }
   }
-| PRIMARY KEY '(' index_params ')' opt_hash_sharded
+| PRIMARY KEY '(' index_params ')' opt_hash_sharded opt_interleave
   {
     $$.val = &tree.UniqueConstraintTableDef{
       IndexTableDef: tree.IndexTableDef{
         Columns: $4.idxElems(),
         Sharded: $6.shardedIndexDef(),
+        Interleave: $7.interleave(),
       },
       PrimaryKey: true,
     }
@@ -4998,22 +5009,6 @@ reference_action:
     $$.val = tree.SetDefault
   }
 
-numeric_only:
-  FCONST
-  {
-    $$.val = $1.numVal()
-  }
-| '-' FCONST
-  {
-    n := $2.numVal()
-    n.SetNegative()
-    $$.val = n
-  }
-| signed_iconst
-  {
-    $$.val = $1.numVal()
-  }
-
 // %Help: CREATE SEQUENCE - create a new sequence
 // %Category: DDL
 // %Text:
@@ -5136,8 +5131,8 @@ password_clause:
 
 // %Help: CREATE ROLE - define a new role
 // %Category: Priv
-// %Text: CREATE ROLE [IF NOT EXISTS] <name>
-// %SeeAlso: DROP ROLE, SHOW ROLES
+// %Text: CREATE ROLE [IF NOT EXISTS] <name> [WITH] <OPTIONS...>
+// %SeeAlso: ALTER ROLE, DROP ROLE, SHOW ROLES
 create_role_stmt:
   CREATE role_or_group string_or_placeholder
   {
@@ -5147,7 +5142,38 @@ create_role_stmt:
   {
     $$.val = &tree.CreateRole{Name: $6.expr(), IfNotExists: true}
   }
+| CREATE role_or_group string_or_placeholder role_privileges
+  {
+    $$.val = &tree.CreateRole{Name: $3.expr(), RolePrivileges: $4.rolePrivilegeList()}
+  }
+| CREATE role_or_group string_or_placeholder WITH role_privileges
+  {
+    $$.val = &tree.CreateRole{Name: $3.expr(), HasWith: true, RolePrivileges: $5.rolePrivilegeList()}
+  }
+| CREATE role_or_group IF NOT EXISTS string_or_placeholder role_privileges
+  {
+    $$.val = &tree.CreateRole{Name: $6.expr(), IfNotExists: true, RolePrivileges: $7.rolePrivilegeList()}
+  }
+| CREATE role_or_group IF NOT EXISTS string_or_placeholder WITH role_privileges
+  {
+    $$.val = &tree.CreateRole{Name: $6.expr(), IfNotExists: true, HasWith: true, RolePrivileges: $8.rolePrivilegeList()}
+  }
 | CREATE role_or_group error // SHOW HELP: CREATE ROLE
+
+// %Help: ALTER ROLE - alter a role
+// %Category: Priv
+// %Text: ALTER ROLE <name> [WITH] <options...>
+// %SeeAlso: CREATE ROLE, DROP ROLE, SHOW ROLES
+alter_role_stmt:
+  ALTER role_or_group string_or_placeholder role_privileges
+  {
+  $$.val = &tree.AlterRolePrivileges{Name: $3.expr(), RolePrivileges: $4.rolePrivilegeList()}
+  }
+| ALTER role_or_group string_or_placeholder WITH role_privileges
+  {
+    $$.val = &tree.AlterRolePrivileges{Name: $3.expr(), HasWith: true, RolePrivileges: $5.rolePrivilegeList()}
+  }
+| ALTER role_or_group error // SHOW HELP: ALTER ROLE
 
 // "CREATE GROUP is now an alias for CREATE ROLE"
 // https://www.postgresql.org/docs/10/static/sql-creategroup.html
@@ -5184,6 +5210,30 @@ create_view_stmt:
   }
 | CREATE OR REPLACE opt_temp opt_view_recursive VIEW error { return unimplementedWithIssue(sqllex, 24897) }
 | CREATE opt_temp opt_view_recursive VIEW error // SHOW HELP: CREATE VIEW
+
+role_privilege:
+  CREATEROLE
+  | NOCREATEROLE
+
+role_privileges:
+  role_privilege_list
+  {
+    rolePrivList, err := roleprivilege.ListFromStrings($1.nameList().ToStrings())
+    if err != nil {
+      return setErr(sqllex, err)
+    }
+    $$.val = rolePrivList
+  }
+
+role_privilege_list:
+  role_privilege
+  {
+    $$.val = tree.NameList{tree.Name($1)}
+  }
+  | role_privilege role_privilege_list
+  {
+    $$.val = append($2.nameList(), tree.Name($1))
+  }
 
 opt_view_recursive:
   /* EMPTY */ { /* no error */ }
@@ -6450,9 +6500,20 @@ limit_clause:
     }
   }
 // SQL:2008 syntax
-| FETCH first_or_next opt_select_fetch_first_value row_or_rows ONLY
+// To avoid shift/reduce conflicts, handle the optional value with
+// a separate production rather than an opt_ expression. The fact
+// that ONLY is fully reserved means that this way, we defer any
+// decision about what rule reduces ROW or ROWS to the point where
+// we can see the ONLY token in the lookahead slot.
+| FETCH first_or_next select_fetch_first_value row_or_rows ONLY
   {
     $$.val = &tree.Limit{Count: $3.expr()}
+  }
+| FETCH first_or_next row_or_rows ONLY
+	{
+    $$.val = &tree.Limit{
+      Count: tree.NewNumVal(constant.MakeInt64(1), "" /* origString */, false /* negative */),
+    }
   }
 
 offset_clause:
@@ -6463,27 +6524,26 @@ offset_clause:
   // SQL:2008 syntax
   // The trailing ROW/ROWS in this case prevent the full expression
   // syntax. c_expr is the best we can do.
-| OFFSET c_expr row_or_rows
+| OFFSET select_fetch_first_value row_or_rows
   {
     $$.val = &tree.Limit{Offset: $2.expr()}
   }
 
 // Allowing full expressions without parentheses causes various parsing
-// problems with the trailing ROW/ROWS key words. SQL only calls for constants,
-// so we allow the rest only with parentheses. If omitted, default to 1.
- opt_select_fetch_first_value:
-   signed_iconst
-   {
-     $$.val = $1.expr()
-   }
- | '(' a_expr ')'
-   {
-     $$.val = $2.expr()
-   }
- | /* EMPTY */
-   {
-     $$.val = tree.NewNumVal(constant.MakeInt64(1), "" /* origString */, false /* negative */)
-   }
+// problems with the trailing ROW/ROWS key words. SQL spec only calls for
+// <simple value specification>, which is either a literal or a parameter (but
+// an <SQL parameter reference> could be an identifier, bringing up conflicts
+// with ROW/ROWS). We solve this by leveraging the presence of ONLY (see above)
+// to determine whether the expression is missing rather than trying to make it
+// optional in this rule.
+//
+// c_expr covers almost all the spec-required cases (and more), but it doesn't
+// cover signed numeric literals, which are allowed by the spec. So we include
+// those here explicitly.
+select_fetch_first_value:
+  c_expr
+| only_signed_iconst
+| only_signed_fconst
 
 // noise words
 row_or_rows:
@@ -9333,13 +9393,36 @@ name_list:
   }
 
 // Constants
+numeric_only:
+  signed_iconst
+| signed_fconst
+
 signed_iconst:
   ICONST
-| '+' ICONST
+| only_signed_iconst
+
+only_signed_iconst:
+  '+' ICONST
   {
     $$.val = $2.numVal()
   }
 | '-' ICONST
+  {
+    n := $2.numVal()
+    n.SetNegative()
+    $$.val = n
+  }
+
+signed_fconst:
+  FCONST
+| only_signed_fconst
+
+only_signed_fconst:
+  '+' FCONST
+  {
+    $$.val = $2.numVal()
+  }
+| '-' FCONST
   {
     n := $2.numVal()
     n.SetNegative()
@@ -9689,6 +9772,7 @@ unreserved_keyword:
 | CONVERSION
 | COPY
 | COVERING
+| CREATEROLE
 | CUBE
 | CURRENT
 | CYCLE
@@ -9782,6 +9866,7 @@ unreserved_keyword:
 | NO
 | NORMAL
 | NO_INDEX_JOIN
+| NOCREATEROLE
 | NOWAIT
 | NULLS
 | IGNORE_FOREIGN_KEYS

@@ -472,7 +472,7 @@
 
 [[projects]]
   branch = "master"
-  digest = "1:4ab04b62cf7bccc6112aba859e91c968e65ec2d6514a4f22c2d6a0a25c9eec00"
+  digest = "1:dc54789e0f16728ed007c85d9db76bcbe4ecafb08ceda930cc1deea2197a0609"
   name = "github.com/cockroachdb/pebble"
   packages = [
     ".",
@@ -484,6 +484,7 @@
     "internal/cache",
     "internal/crc",
     "internal/humanize",
+    "internal/intern",
     "internal/invariants",
     "internal/manifest",
     "internal/manual",
@@ -497,7 +498,7 @@
     "vfs",
   ]
   pruneopts = "UT"
-  revision = "9fa17a27f5d9d849ae4da919535c77f837dfcd2e"
+  revision = "488fb5bfea764c8ba7f77b279d4faf6724939839"
 
 [[projects]]
   branch = "master"
@@ -1572,15 +1573,15 @@
   version = "v1.0.3"
 
 [[projects]]
-  digest = "1:5da8ce674952566deae4dbc23d07c85caafc6cfa815b0b3e03e41979cedb8750"
+  digest = "1:99d32780e5238c2621fff621123997c3e3cca96db8be13179013aea77dfab551"
   name = "github.com/stretchr/testify"
   packages = [
     "assert",
     "require",
   ]
   pruneopts = "UT"
-  revision = "ffdc059bfe9ce6a4e144ba849dbedead332c6053"
-  version = "v1.3.0"
+  revision = "221dbe5ed46703ee255b1da0dec05086f5035f62"
+  version = "v1.4.0"
 
 [[projects]]
   branch = "master"

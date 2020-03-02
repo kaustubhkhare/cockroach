@@ -36,7 +36,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
@@ -49,10 +48,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -128,19 +129,20 @@ func propagateGatewayMetadata(ctx context.Context) context.Context {
 type statusServer struct {
 	log.AmbientContext
 
-	st              *cluster.Settings
-	cfg             *base.Config
-	admin           *adminServer
-	db              *client.DB
-	gossip          *gossip.Gossip
-	metricSource    metricMarshaler
-	nodeLiveness    *storage.NodeLiveness
-	storePool       *storage.StorePool
-	rpcCtx          *rpc.Context
-	stores          *storage.Stores
-	stopper         *stop.Stopper
-	sessionRegistry *sql.SessionRegistry
-	si              systemInfoOnce
+	st                       *cluster.Settings
+	cfg                      *base.Config
+	admin                    *adminServer
+	db                       *client.DB
+	gossip                   *gossip.Gossip
+	metricSource             metricMarshaler
+	nodeLiveness             *storage.NodeLiveness
+	storePool                *storage.StorePool
+	rpcCtx                   *rpc.Context
+	stores                   *storage.Stores
+	stopper                  *stop.Stopper
+	sessionRegistry          *sql.SessionRegistry
+	si                       systemInfoOnce
+	stmtDiagnosticsRequester sql.StmtDiagnosticsRequester
 }
 
 // newStatusServer allocates and returns a statusServer.
@@ -275,18 +277,22 @@ func (s *statusServer) EngineStats(
 
 	resp := new(serverpb.EngineStatsResponse)
 	err = s.stores.VisitStores(func(store *storage.Store) error {
-		tickersAndHistograms, err := store.Engine().GetTickersAndHistograms()
-		if err != nil {
-			return grpcstatus.Errorf(codes.Internal, err.Error())
+		engineStatsInfo := serverpb.EngineStatsInfo{
+			StoreID:              store.Ident.StoreID,
+			TickersAndHistograms: nil,
+			EngineType:           store.Engine().Type(),
 		}
-		resp.Stats = append(
-			resp.Stats,
-			serverpb.EngineStatsInfo{
-				StoreID:              store.Ident.StoreID,
-				TickersAndHistograms: tickersAndHistograms,
-				EngineType:           store.Engine().Type(),
-			},
-		)
+
+		switch e := store.Engine().(type) {
+		case *engine.RocksDB:
+			tickersAndHistograms, err := e.GetTickersAndHistograms()
+			if err != nil {
+				return grpcstatus.Errorf(codes.Internal, err.Error())
+			}
+			engineStatsInfo.TickersAndHistograms = tickersAndHistograms
+		}
+
+		resp.Stats = append(resp.Stats, engineStatsInfo)
 		return nil
 	})
 	if err != nil {
@@ -1637,7 +1643,9 @@ func (s *statusServer) iterateNodes(
 	}
 
 	// Issue the requests concurrently.
-	sem := make(chan struct{}, maxConcurrentRequests)
+	sem := quotapool.NewIntPool("node status", maxConcurrentRequests)
+	ctx, cancel := s.stopper.WithCancelOnStop(ctx)
+	defer cancel()
 	for nodeID := range nodeStatuses {
 		nodeID := nodeID // needed to ensure the closure below captures a copy.
 		if err := s.stopper.RunLimitedAsyncTask(
@@ -1998,7 +2006,7 @@ func (si *systemInfoOnce) systemInfo(ctx context.Context) serverpb.SystemInfo {
 	return si.info
 }
 
-// RegistryStatus returns details about the jobs running on the registry at a
+// JobRegistryStatus returns details about the jobs running on the registry at a
 // particular node.
 func (s *statusServer) JobRegistryStatus(
 	ctx context.Context, req *serverpb.JobRegistryStatusRequest,
@@ -2026,10 +2034,31 @@ func (s *statusServer) JobRegistryStatus(
 		NodeID: remoteNodeID,
 	}
 	for _, jID := range s.admin.server.jobRegistry.CurrentlyRunningJobs() {
-		job := jobspb.Job{
+		job := serverpb.JobRegistryStatusResponse_Job{
 			Id: jID,
 		}
 		resp.RunningJobs = append(resp.RunningJobs, &job)
 	}
 	return resp, nil
+}
+
+// JobStatus returns details about the jobs running on the registry at a
+// particular node.
+func (s *statusServer) JobStatus(
+	ctx context.Context, req *serverpb.JobStatusRequest,
+) (*serverpb.JobStatusResponse, error) {
+	if _, err := s.admin.requireAdminUser(ctx); err != nil {
+		return nil, err
+	}
+
+	ctx = propagateGatewayMetadata(ctx)
+	ctx = s.AnnotateCtx(ctx)
+
+	j, err := s.admin.server.jobRegistry.LoadJob(ctx, req.JobId)
+	if err != nil {
+		return nil, err
+	}
+	return &serverpb.JobStatusResponse{
+		Job: j.ToProto(),
+	}, nil
 }

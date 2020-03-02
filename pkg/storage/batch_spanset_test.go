@@ -13,11 +13,11 @@ package storage
 import (
 	"bytes"
 	"context"
-	"math"
 	"reflect"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/storage/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/spanset"
@@ -544,17 +544,18 @@ func TestSpanSetMVCCResolveWriteIntentRangeUsingIter(t *testing.T) {
 	batch := spanset.NewBatch(eng.NewBatch(), &ss)
 	defer batch.Close()
 
-	intent := roachpb.Intent{
-		Span:   roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("b\x00")},
-		Txn:    enginepb.TxnMeta{}, // unused
-		Status: roachpb.PENDING,
+	intent := roachpb.LockUpdate{
+		Span:       roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("b\x00")},
+		Txn:        enginepb.TxnMeta{}, // unused
+		Status:     roachpb.PENDING,
+		Durability: lock.Replicated,
 	}
 
 	iterAndBuf := engine.GetIterAndBuf(batch, engine.IterOptions{UpperBound: intent.Span.EndKey})
 	defer iterAndBuf.Cleanup()
 
 	if _, _, err := engine.MVCCResolveWriteIntentRangeUsingIter(
-		ctx, batch, iterAndBuf, nil /* ms */, intent, math.MaxInt64,
+		ctx, batch, iterAndBuf, nil /* ms */, intent, 0,
 	); err != nil {
 		t.Fatal(err)
 	}

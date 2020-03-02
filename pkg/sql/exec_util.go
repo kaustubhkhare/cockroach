@@ -183,6 +183,12 @@ var optDrivenFKClusterMode = settings.RegisterBoolSetting(
 	true,
 )
 
+var implicitSelectForUpdateClusterMode = settings.RegisterBoolSetting(
+	"sql.defaults.implicit_select_for_update.enabled",
+	"default value for enable_implicit_select_for_update session setting; enables FOR UPDATE locking during the row-fetch phase of mutation statements",
+	true,
+)
+
 var insertFastPathClusterMode = settings.RegisterBoolSetting(
 	"sql.defaults.insert_fast_path.enabled",
 	"default value for enable_insert_fast_path session setting; enables a specialized insert path",
@@ -197,6 +203,7 @@ var VectorizeClusterMode = settings.RegisterEnumSetting(
 	"auto",
 	map[int64]string{
 		int64(sessiondata.VectorizeOff):            "off",
+		int64(sessiondata.Vectorize192Auto):        "192auto",
 		int64(sessiondata.VectorizeAuto):           "auto",
 		int64(sessiondata.VectorizeExperimentalOn): "experimental_on",
 	},
@@ -262,12 +269,6 @@ var (
 		Help:        "Latency of SQL request execution",
 		Measurement: "Latency",
 		Unit:        metric.Unit_NANOSECONDS,
-	}
-	MetaSQLOpt = metric.Metadata{
-		Name:        "sql.optimizer.count",
-		Help:        "Number of statements which ran with the cost-based optimizer",
-		Measurement: "SQL Statements",
-		Unit:        metric.Unit_COUNT,
 	}
 	MetaSQLOptFallback = metric.Metadata{
 		Name:        "sql.optimizer.fallback.count",
@@ -548,6 +549,7 @@ type ExecutorConfig struct {
 	StatsRefresher    *stats.Refresher
 	ExecLogger        *log.SecondaryLogger
 	AuditLogger       *log.SecondaryLogger
+	SlowQueryLogger   *log.SecondaryLogger
 	InternalExecutor  *InternalExecutor
 	QueryCache        *querycache.C
 
@@ -568,11 +570,24 @@ type ExecutorConfig struct {
 
 	// ProtectedTimestampProvider encapsulates the protected timestamp subsystem.
 	ProtectedTimestampProvider protectedts.Provider
+
+	stmtInfoRequestRegistry *stmtDiagnosticsRequestRegistry
 }
 
 // Organization returns the value of cluster.organization.
-func (ec *ExecutorConfig) Organization() string {
-	return ClusterOrganization.Get(&ec.Settings.SV)
+func (cfg *ExecutorConfig) Organization() string {
+	return ClusterOrganization.Get(&cfg.Settings.SV)
+}
+
+// NewStmtDiagnosticsRequestRegistry initializes cfg.stmtInfoRequestRegistry and
+// returns it as the publicly-accessible StmtDiagnosticsRequester.
+func (cfg *ExecutorConfig) NewStmtDiagnosticsRequestRegistry() StmtDiagnosticsRequester {
+	if cfg.InternalExecutor == nil {
+		panic("cfg.InternalExecutor not initialized")
+	}
+	cfg.stmtInfoRequestRegistry = newStmtDiagnosticsRequestRegistry(
+		cfg.InternalExecutor, cfg.DB, cfg.Gossip, cfg.NodeID.Get())
+	return cfg.stmtInfoRequestRegistry
 }
 
 var _ base.ModuleTestingKnobs = &ExecutorTestingKnobs{}
@@ -1489,7 +1504,7 @@ func (st *SessionTracing) TraceExecEnd(ctx context.Context, err error, count int
 
 // extractMsgFromRecord extracts the message of the event, which is either in an
 // "event" or "error" field.
-func extractMsgFromRecord(rec tracing.RecordedSpan_LogRecord) string {
+func extractMsgFromRecord(rec tracing.LogRecord) string {
 	for _, f := range rec.Fields {
 		key := f.Key
 		if key == "event" {
@@ -1887,6 +1902,10 @@ func (m *sessionDataMutator) SetOptimizerFKs(val bool) {
 	m.data.OptimizerFKs = val
 }
 
+func (m *sessionDataMutator) SetImplicitSelectForUpdate(val bool) {
+	m.data.ImplicitSelectForUpdate = val
+}
+
 func (m *sessionDataMutator) SetInsertFastPath(val bool) {
 	m.data.InsertFastPath = val
 }
@@ -1967,7 +1986,6 @@ func (s *sqlStatsCollector) recordStatement(
 	stmt *Statement,
 	samplePlanDescription *roachpb.ExplainTreePlanNode,
 	distSQLUsed bool,
-	optUsed bool,
 	implicitTxn bool,
 	automaticRetryCount int,
 	numRows int,
@@ -1976,7 +1994,7 @@ func (s *sqlStatsCollector) recordStatement(
 	bytesRead, rowsRead int64,
 ) {
 	s.appStats.recordStatement(
-		stmt, samplePlanDescription, distSQLUsed, optUsed, implicitTxn, automaticRetryCount, numRows, err,
+		stmt, samplePlanDescription, distSQLUsed, implicitTxn, automaticRetryCount, numRows, err,
 		parseLat, planLat, runLat, svcLat, ovhLat, bytesRead, rowsRead)
 }
 

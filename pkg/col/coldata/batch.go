@@ -13,6 +13,7 @@ package coldata
 import (
 	"fmt"
 	"math"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
 )
@@ -57,6 +58,8 @@ type Batch interface {
 	// batches that they reuse as not doing this could result in correctness
 	// or memory blowup issues.
 	ResetInternalBatch()
+	// String returns a pretty representation of this batch.
+	String() string
 }
 
 var _ Batch = &MemBatch{}
@@ -104,17 +107,23 @@ func NewMemBatch(types []coltypes.T) Batch {
 // NewMemBatchWithSize allocates a new in-memory Batch with the given column
 // size. Use for operators that have a precisely-sized output batch.
 func NewMemBatchWithSize(types []coltypes.T, size int) Batch {
+	b := NewMemBatchNoCols(types, size).(*MemBatch)
+	for i, t := range types {
+		b.b[i] = NewMemColumn(t, size)
+	}
+	return b
+}
+
+// NewMemBatchNoCols creates a "skeleton" of new in-memory Batch. It allocates
+// memory for the selection vector but does *not* allocate any memory for the
+// column vectors - those will have to be added separately.
+func NewMemBatchNoCols(types []coltypes.T, size int) Batch {
 	if max := math.MaxUint16; size > max {
 		panic(fmt.Sprintf(`batches cannot have length larger than %d; requested %d`, max, size))
 	}
 	b := &MemBatch{}
 	b.b = make([]Vec, len(types))
-
-	for i, t := range types {
-		b.b[i] = NewMemColumn(t, size)
-	}
 	b.sel = make([]uint16, size)
-
 	return b
 }
 
@@ -202,7 +211,7 @@ func (m *MemBatch) SetSelection(b bool) {
 func (m *MemBatch) SetLength(n uint16) {
 	m.n = n
 	for _, v := range m.b {
-		if v.Type() == coltypes.Bytes {
+		if v != nil && v.Type() == coltypes.Bytes {
 			v.Bytes().UpdateOffsetsToBeNonDecreasing(uint64(n))
 		}
 	}
@@ -262,4 +271,23 @@ func (m *MemBatch) ResetInternalBatch() {
 			v.Bytes().Reset()
 		}
 	}
+}
+
+// String returns a pretty representation of this batch.
+func (m *MemBatch) String() string {
+	if m.Length() == 0 {
+		return "[zero-length batch]"
+	}
+	var builder strings.Builder
+	strs := make([]string, len(m.ColVecs()))
+	for i := 0; i < int(m.Length()); i++ {
+		builder.WriteString("\n[")
+		for colIdx, v := range m.ColVecs() {
+			strs[colIdx] = fmt.Sprintf("%v", GetValueAt(v, uint16(i), v.Type()))
+		}
+		builder.WriteString(strings.Join(strs, ", "))
+		builder.WriteString("]")
+	}
+	builder.WriteString("\n")
+	return builder.String()
 }

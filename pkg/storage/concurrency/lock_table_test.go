@@ -42,17 +42,17 @@ import (
 Test needs to handle caller constraints wrt latches being held. The datadriven
 test uses the following format:
 
-locktable maxlocks=<int>
+new-locktable maxlocks=<int>
 ----
 
   Creates a lockTable.
 
-txn txn=<name> ts=<int>[,<int>] epoch=<int>
+new-txn txn=<name> ts=<int>[,<int>] epoch=<int> [seq=<int>]
 ----
 
  Creates a TxnMeta.
 
-request r=<name> txn=<name>|none ts=<int>[,<int>] spans=r|w@<start>[,<end>]+...
+new-request r=<name> txn=<name>|none ts=<int>[,<int>] spans=r|w@<start>[,<end>]+...
 ----
 
  Creates a Request.
@@ -88,98 +88,38 @@ add-discovered r=<name> k=<key> txn=<name>
 
  Adds a discovered lock that is disovered by the named request.
 
-done r=<name>
+dequeue r=<name>
 ----
 <error string>
 
- Calls lockTable.Dequeue() for the named request. The request and guard are
+ Calls lockTable.Dequeue for the named request. The request and guard are
  discarded after this.
 
 guard-state r=<name>
 ----
 new|old: state=<state> [txn=<name> ts=<ts>]
 
-  Calls lockTableGuard.NewStateChan() in a non-blocking manner, followed by
-  CurState().
+  Calls lockTableGuard.NewStateChan in a non-blocking manner, followed by
+  CurState.
 
-guard-start-waiting r=<name>
+should-wait r=<name>
 ----
 <bool>
 
- Calls lockTableGuard.ShouldWait().
+ Calls lockTableGuard.ShouldWait.
+
+clear
+----
+<state of lock table>
+
+ Calls lockTable.Clear.
 
 print
 ----
 <state of lock table>
 
- Calls lockTable.String()
+ Calls lockTable.String.
 */
-
-func scanTimestamp(t *testing.T, d *datadriven.TestData) hlc.Timestamp {
-	var ts hlc.Timestamp
-	var tsS string
-	d.ScanArgs(t, "ts", &tsS)
-	parts := strings.Split(tsS, ",")
-
-	// Find the wall time part.
-	tsW, err := strconv.ParseInt(parts[0], 10, 64)
-	if err != nil {
-		d.Fatalf(t, "%v", err)
-	}
-	ts.WallTime = tsW
-
-	// Find the logical part, if there is one.
-	var tsL int64
-	if len(parts) > 1 {
-		tsL, err = strconv.ParseInt(parts[1], 10, 32)
-		if err != nil {
-			d.Fatalf(t, "%v", err)
-		}
-	}
-	ts.Logical = int32(tsL)
-	return ts
-}
-
-func nextUUID(counter *uint128.Uint128) uuid.UUID {
-	*counter = counter.Add(1)
-	return uuid.FromUint128(*counter)
-}
-
-func getSpan(t *testing.T, d *datadriven.TestData, str string) roachpb.Span {
-	parts := strings.Split(str, ",")
-	span := roachpb.Span{Key: roachpb.Key(parts[0])}
-	if len(parts) > 2 {
-		d.Fatalf(t, "incorrect span format: %s", str)
-	} else if len(parts) == 2 {
-		span.EndKey = roachpb.Key(parts[1])
-	}
-	return span
-}
-
-func scanSpans(t *testing.T, d *datadriven.TestData, ts hlc.Timestamp) *spanset.SpanSet {
-	spans := &spanset.SpanSet{}
-	var spansStr string
-	d.ScanArgs(t, "spans", &spansStr)
-	parts := strings.Split(spansStr, "+")
-	for _, p := range parts {
-		if len(p) < 2 || p[1] != '@' {
-			d.Fatalf(t, "incorrect span with access format: %s", p)
-		}
-		c := p[0]
-		p = p[2:]
-		var sa spanset.SpanAccess
-		switch c {
-		case 'r':
-			sa = spanset.SpanReadOnly
-		case 'w':
-			sa = spanset.SpanReadWrite
-		default:
-			d.Fatalf(t, "incorrect span access: %c", c)
-		}
-		spans.AddMVCC(sa, getSpan(t, d, p), ts)
-	}
-	return spans
-}
 
 func TestLockTableBasic(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -192,13 +132,13 @@ func TestLockTableBasic(t *testing.T) {
 		guardsByReqName := make(map[string]lockTableGuard)
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 			switch d.Cmd {
-			case "locktable":
+			case "new-lock-table":
 				var maxLocks int
 				d.ScanArgs(t, "maxlocks", &maxLocks)
-				lt = newLockTable(int64(maxLocks))
+				lt = &lockTableImpl{maxLocks: int64(maxLocks)}
 				return ""
 
-			case "txn":
+			case "new-txn":
 				// UUIDs for transactions are numbered from 1 by this test code and
 				// lockTableImpl.String() knows about UUIDs and not transaction names.
 				// Assigning txnNames of the form txn1, txn2, ... keeps the two in sync,
@@ -208,6 +148,10 @@ func TestLockTableBasic(t *testing.T) {
 				ts := scanTimestamp(t, d)
 				var epoch int
 				d.ScanArgs(t, "epoch", &epoch)
+				var seq int
+				if d.HasArg("seq") {
+					d.ScanArgs(t, "seq", &seq)
+				}
 				txnMeta, ok := txnsByName[txnName]
 				var id uuid.UUID
 				if ok {
@@ -218,11 +162,12 @@ func TestLockTableBasic(t *testing.T) {
 				txnsByName[txnName] = &enginepb.TxnMeta{
 					ID:             id,
 					Epoch:          enginepb.TxnEpoch(epoch),
+					Sequence:       enginepb.TxnSeq(seq),
 					WriteTimestamp: ts,
 				}
 				return ""
 
-			case "request":
+			case "new-request":
 				// Seqnums for requests are numbered from 1 by lockTableImpl and
 				// lockTableImpl.String() does not know about request names. Assigning
 				// request names of the form req1, req2, ... keeps the two in sync,
@@ -299,7 +244,7 @@ func TestLockTableBasic(t *testing.T) {
 				d.ScanArgs(t, "span", &s)
 				span := getSpan(t, d, s)
 				// TODO(sbhola): also test ABORTED.
-				intent := &roachpb.Intent{Span: span, Txn: *txnMeta, Status: roachpb.COMMITTED}
+				intent := &roachpb.LockUpdate{Span: span, Txn: *txnMeta, Status: roachpb.COMMITTED}
 				if err := lt.UpdateLocks(intent); err != nil {
 					return err.Error()
 				}
@@ -323,7 +268,7 @@ func TestLockTableBasic(t *testing.T) {
 				d.ScanArgs(t, "span", &s)
 				span := getSpan(t, d, s)
 				// TODO(sbhola): also test STAGING.
-				intent := &roachpb.Intent{Span: span, Txn: *txnMeta, Status: roachpb.PENDING}
+				intent := &roachpb.LockUpdate{Span: span, Txn: *txnMeta, Status: roachpb.PENDING}
 				if err := lt.UpdateLocks(intent); err != nil {
 					return err.Error()
 				}
@@ -344,15 +289,13 @@ func TestLockTableBasic(t *testing.T) {
 				if !ok {
 					d.Fatalf(t, "unknown txn %s", txnName)
 				}
-				span := roachpb.Span{Key: roachpb.Key(key)}
-				intent := &roachpb.Intent{Span: span, Txn: *txnMeta, Status: roachpb.PENDING}
-				if err := lt.AddDiscoveredLock(intent, g); err != nil {
+				intent := roachpb.MakeIntent(txnMeta, roachpb.Key(key))
+				if err := lt.AddDiscoveredLock(&intent, g); err != nil {
 					return err.Error()
 				}
 				return lt.(*lockTableImpl).String()
 
-			case "done":
-				// TODO(nvanbenschoten): rename this command to dequeue.
+			case "dequeue":
 				var reqName string
 				d.ScanArgs(t, "r", &reqName)
 				g := guardsByReqName[reqName]
@@ -364,8 +307,7 @@ func TestLockTableBasic(t *testing.T) {
 				delete(requestsByName, reqName)
 				return lt.(*lockTableImpl).String()
 
-			case "guard-start-waiting":
-				// TODO(nvanbenschoten): rename this command to should-wait.
+			case "should-wait":
 				var reqName string
 				d.ScanArgs(t, "r", &reqName)
 				g := guardsByReqName[reqName]
@@ -420,6 +362,10 @@ func TestLockTableBasic(t *testing.T) {
 				return fmt.Sprintf("%sstate=%s txn=%s ts=%s key=%s held=%t guard-access=%s",
 					str, typeStr, txnS, tsS, state.key, state.held, state.guardAccess)
 
+			case "clear":
+				lt.Clear()
+				return lt.(*lockTableImpl).String()
+
 			case "print":
 				return lt.(*lockTableImpl).String()
 
@@ -430,6 +376,72 @@ func TestLockTableBasic(t *testing.T) {
 	})
 }
 
+func nextUUID(counter *uint128.Uint128) uuid.UUID {
+	*counter = counter.Add(1)
+	return uuid.FromUint128(*counter)
+}
+
+func scanTimestamp(t *testing.T, d *datadriven.TestData) hlc.Timestamp {
+	var ts hlc.Timestamp
+	var tsS string
+	d.ScanArgs(t, "ts", &tsS)
+	parts := strings.Split(tsS, ",")
+
+	// Find the wall time part.
+	tsW, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		d.Fatalf(t, "%v", err)
+	}
+	ts.WallTime = tsW
+
+	// Find the logical part, if there is one.
+	var tsL int64
+	if len(parts) > 1 {
+		tsL, err = strconv.ParseInt(parts[1], 10, 32)
+		if err != nil {
+			d.Fatalf(t, "%v", err)
+		}
+	}
+	ts.Logical = int32(tsL)
+	return ts
+}
+
+func getSpan(t *testing.T, d *datadriven.TestData, str string) roachpb.Span {
+	parts := strings.Split(str, ",")
+	span := roachpb.Span{Key: roachpb.Key(parts[0])}
+	if len(parts) > 2 {
+		d.Fatalf(t, "incorrect span format: %s", str)
+	} else if len(parts) == 2 {
+		span.EndKey = roachpb.Key(parts[1])
+	}
+	return span
+}
+
+func scanSpans(t *testing.T, d *datadriven.TestData, ts hlc.Timestamp) *spanset.SpanSet {
+	spans := &spanset.SpanSet{}
+	var spansStr string
+	d.ScanArgs(t, "spans", &spansStr)
+	parts := strings.Split(spansStr, "+")
+	for _, p := range parts {
+		if len(p) < 2 || p[1] != '@' {
+			d.Fatalf(t, "incorrect span with access format: %s", p)
+		}
+		c := p[0]
+		p = p[2:]
+		var sa spanset.SpanAccess
+		switch c {
+		case 'r':
+			sa = spanset.SpanReadOnly
+		case 'w':
+			sa = spanset.SpanReadWrite
+		default:
+			d.Fatalf(t, "incorrect span access: %c", c)
+		}
+		spans.AddMVCC(sa, getSpan(t, d, p), ts)
+	}
+	return spans
+}
+
 type workItem struct {
 	// Contains one of request or intents.
 
@@ -438,7 +450,7 @@ type workItem struct {
 	locksToAcquire []roachpb.Key
 
 	// Update locks.
-	intents []roachpb.Intent
+	intents []roachpb.LockUpdate
 }
 
 func (w *workItem) getRequestTxnID() uuid.UUID {
@@ -565,7 +577,7 @@ type transactionState struct {
 func makeWorkItemFinishTxn(tstate *transactionState) workItem {
 	wItem := workItem{}
 	for i := range tstate.acquiredLocks {
-		wItem.intents = append(wItem.intents, roachpb.Intent{
+		wItem.intents = append(wItem.intents, roachpb.LockUpdate{
 			Span:   roachpb.Span{Key: tstate.acquiredLocks[i]},
 			Txn:    *tstate.txn,
 			Status: roachpb.COMMITTED,
@@ -600,7 +612,7 @@ type workloadExecutor struct {
 func newWorkLoadExecutor(items []workloadItem, concurrency int) *workloadExecutor {
 	return &workloadExecutor{
 		lm:           spanlatch.Manager{},
-		lt:           newLockTable(1000),
+		lt:           &lockTableImpl{maxLocks: 1000},
 		items:        items,
 		transactions: make(map[uuid.UUID]*transactionState),
 		doneWork:     make(chan *workItem),
@@ -706,8 +718,9 @@ func (e *workloadExecutor) tryFinishTxn(
 // respected since requests may be waiting for locks to be released. The
 // executor waits for a tiny interval when concurrency is >= L and if
 // no request completes it starts another request. Just for our curiosity
-// these "concurrency violations" are tracked in a counter.
-func (e *workloadExecutor) execute(strict bool) error {
+// these "concurrency violations" are tracked in a counter. The amount of
+// concurrency in this non-strict mode is bounded by maxNonStrictConcurrency.
+func (e *workloadExecutor) execute(strict bool, maxNonStrictConcurrency int) error {
 	numOutstanding := 0
 	i := 0
 	group, ctx := errgroup.WithContext(context.TODO())
@@ -733,6 +746,8 @@ L:
 				if strictIter {
 					err = errors.Errorf("timer expired with lock table: %v", e.lt)
 					break L
+				} else if numOutstanding > maxNonStrictConcurrency {
+					continue
 				} else {
 					e.numConcViolations++
 				}
@@ -864,7 +879,7 @@ func TestLockTableConcurrentSingleRequests(t *testing.T) {
 	for _, c := range concurrency {
 		t.Run(fmt.Sprintf("concurrency %d", c), func(t *testing.T) {
 			exec := newWorkLoadExecutor(items, c)
-			if err := exec.execute(true); err != nil {
+			if err := exec.execute(true, 0); err != nil {
 				t.Fatal(err)
 			}
 		})
@@ -890,7 +905,7 @@ func TestLockTableConcurrentRequests(t *testing.T) {
 	const numActiveTxns = 8
 	var activeTxns [numActiveTxns]*enginepb.TxnMeta
 	var items []workloadItem
-	const numRequests = 20000
+	const numRequests = 1000
 	for i := 0; i < numRequests; i++ {
 		var txnMeta *enginepb.TxnMeta
 		var ts hlc.Timestamp
@@ -930,13 +945,22 @@ func TestLockTableConcurrentRequests(t *testing.T) {
 		for i := 0; i < numKeys; i++ {
 			span := roachpb.Span{Key: keys[keysPerm[i]]}
 			acc := spanset.SpanReadOnly
+			dupRead := false
 			if !onlyReads {
 				acc = spanset.SpanAccess(rng.Intn(int(spanset.NumSpanAccess)))
 				if acc == spanset.SpanReadWrite && txnMeta != nil && rng.Intn(2) == 0 {
+					// Acquire lock.
 					wi.locksToAcquire = append(wi.locksToAcquire, span.Key)
+				}
+				if acc == spanset.SpanReadWrite && rng.Intn(2) == 0 {
+					// Also include the key as read.
+					dupRead = true
 				}
 			}
 			spans.AddMVCC(acc, span, ts)
+			if dupRead {
+				spans.AddMVCC(spanset.SpanReadOnly, span, ts)
+			}
 		}
 		items = append(items, wi)
 	}
@@ -949,7 +973,7 @@ func TestLockTableConcurrentRequests(t *testing.T) {
 	for _, c := range concurrency {
 		t.Run(fmt.Sprintf("concurrency %d", c), func(t *testing.T) {
 			exec := newWorkLoadExecutor(items, c)
-			if err := exec.execute(false); err != nil {
+			if err := exec.execute(false, 200); err != nil {
 				t.Fatal(err)
 			}
 		})
@@ -1021,7 +1045,7 @@ func doBenchWork(item *benchWorkItem, env benchEnv, doneCh chan<- error) {
 		return
 	}
 	for _, k := range item.locksToAcquire {
-		intent := roachpb.Intent{
+		intent := roachpb.LockUpdate{
 			Span:   roachpb.Span{Key: k},
 			Txn:    item.Request.Txn.TxnMeta,
 			Status: roachpb.COMMITTED,
@@ -1134,7 +1158,7 @@ func BenchmarkLockTable(b *testing.B) {
 						var numScanCalls uint64
 						env := benchEnv{
 							lm:                &spanlatch.Manager{},
-							lt:                newLockTable(100000),
+							lt:                &lockTableImpl{maxLocks: 100000},
 							numRequestsWaited: &numRequestsWaited,
 							numScanCalls:      &numScanCalls,
 						}

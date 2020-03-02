@@ -556,7 +556,7 @@ func TestPGPreparedQuery(t *testing.T) {
 			baseTest.Results("users", "primary", false, 1, "username", "ASC", false, false),
 		}},
 		{"SHOW TABLES FROM system", []preparedQueryTest{
-			baseTest.Results("comments").Others(21),
+			baseTest.Results("comments").Others(25),
 		}},
 		{"SHOW SCHEMAS FROM system", []preparedQueryTest{
 			baseTest.Results("crdb_internal").Others(3),
@@ -665,6 +665,11 @@ func TestPGPreparedQuery(t *testing.T) {
 		// 	),
 		// }},
 		{"SELECT * FROM (VALUES (1), (2), (3), (4)) AS foo (a) LIMIT $1 OFFSET $2", []preparedQueryTest{
+			baseTest.SetArgs(1, 0).Results(1),
+			baseTest.SetArgs(1, 1).Results(2),
+			baseTest.SetArgs(1, 2).Results(3),
+		}},
+		{"SELECT * FROM (VALUES (1), (2), (3), (4)) AS foo (a) FETCH FIRST $1 ROWS ONLY OFFSET $2 ROWS", []preparedQueryTest{
 			baseTest.SetArgs(1, 0).Results(1),
 			baseTest.SetArgs(1, 1).Results(2),
 			baseTest.SetArgs(1, 2).Results(3),

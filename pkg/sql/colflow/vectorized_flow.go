@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -30,18 +32,63 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/logtags"
+	"github.com/marusama/semaphore"
 	opentracing "github.com/opentracing/opentracing-go"
 )
+
+// countingSemaphore is a semaphore that keeps track of the semaphore count from
+// its perspective.
+type countingSemaphore struct {
+	semaphore.Semaphore
+	globalCount *metric.Gauge
+	count       int64
+}
+
+func (s *countingSemaphore) Acquire(ctx context.Context, n int) error {
+	if err := s.Semaphore.Acquire(ctx, n); err != nil {
+		return err
+	}
+	atomic.AddInt64(&s.count, int64(n))
+	s.globalCount.Inc(int64(n))
+	return nil
+}
+
+func (s *countingSemaphore) TryAcquire(n int) bool {
+	success := s.Semaphore.TryAcquire(n)
+	if !success {
+		return false
+	}
+	atomic.AddInt64(&s.count, int64(n))
+	s.globalCount.Inc(int64(n))
+	return success
+}
+
+func (s *countingSemaphore) Release(n int) int {
+	atomic.AddInt64(&s.count, int64(-n))
+	s.globalCount.Dec(int64(n))
+	return s.Semaphore.Release(n)
+}
 
 type vectorizedFlow struct {
 	*flowinfra.FlowBase
 	// operatorConcurrency is set if any operators are executed in parallel.
 	operatorConcurrency bool
+
+	// countingSemaphore is a wrapper over a semaphore.Semaphore that keeps track
+	// of the number of resources held in a semaphore.Semaphore requested from the
+	// context of this flow so that these can be released unconditionally upon
+	// Cleanup.
+	countingSemaphore *countingSemaphore
 
 	// streamingMemAccounts are the memory accounts that are tracking the static
 	// memory usage of the whole vectorized flow as well as all dynamic memory of
@@ -53,6 +100,20 @@ type vectorizedFlow struct {
 	// bufferingMemAccounts are the memory accounts that are tracking the dynamic
 	// memory usage of the buffering components.
 	bufferingMemAccounts []*mon.BoundAccount
+
+	tempStorage struct {
+		// path is the path to this flow's temporary storage directory.
+		path string
+		// created is an atomic that is set to 1 when the flow's temporary storage
+		// directory has been created.
+		created int32
+	}
+
+	testingKnobs struct {
+		// onSetupFlow is a testing knob that is called before calling
+		// creator.setupFlow with the given creator.
+		onSetupFlow func(*vectorizedFlowCreator)
+	}
 }
 
 var _ flowinfra.Flow = &vectorizedFlow{}
@@ -85,16 +146,35 @@ func (f *vectorizedFlow) Setup(
 		recordingStats = true
 	}
 	helper := &vectorizedFlowCreatorHelper{f: f.FlowBase}
-	// flowTempStoragePath is the directory to use for this flow's temporary
-	// storage.
-	flowTempStoragePath := filepath.Join(f.Cfg.TempStoragePath, f.GetID().String())
-	if err := f.Cfg.TempFS.CreateDir(flowTempStoragePath); err != nil {
-		return ctx, err
+	// Create a name for this flow's temporary directory. Note that this directory
+	// is lazily created when necessary and cleaned up in Cleanup(). The directory
+	// name is the flow's ID in most cases apart from when the flow's ID is unset
+	// (in the case of local flows). In this case the directory will be prefixed
+	// with "local-flow" and a uuid is generated on the spot to provide a unique
+	// name.
+	tempDirName := f.GetID().String()
+	if f.GetID().Equal(uuid.Nil) {
+		tempDirName = "local-flow" + uuid.FastMakeV4().String()
 	}
-	diskQueueCfg := colcontainer.DiskQueueCfg{FS: f.Cfg.TempFS, Path: flowTempStoragePath}
+	f.tempStorage.path = filepath.Join(f.Cfg.TempStoragePath, tempDirName)
+	diskQueueCfg := colcontainer.DiskQueueCfg{
+		FS:   f.Cfg.TempFS,
+		Path: f.tempStorage.path,
+		OnNewDiskQueueCb: func() {
+			if !atomic.CompareAndSwapInt32(&f.tempStorage.created, 0, 1) {
+				// The temporary storage directory has already been created.
+				return
+			}
+			log.VEventf(ctx, 2, "flow %s spilled to disk, stack trace: %s", f.ID, util.GetSmallTrace(2))
+			if err := f.Cfg.TempFS.CreateDir(f.tempStorage.path); err != nil {
+				execerror.VectorizedInternalPanic(errors.Errorf("unable to create temporary storage directory: %v", err))
+			}
+		},
+	}
 	if err := diskQueueCfg.EnsureDefaults(); err != nil {
 		return ctx, err
 	}
+	f.countingSemaphore = &countingSemaphore{Semaphore: f.Cfg.VecFDSemaphore, globalCount: f.Cfg.Metrics.VecOpenFDs}
 	creator := newVectorizedFlowCreator(
 		helper,
 		vectorizedRemoteComponentCreator{},
@@ -104,7 +184,11 @@ func (f *vectorizedFlow) Setup(
 		f.GetFlowCtx().Cfg.NodeDialer,
 		f.GetID(),
 		diskQueueCfg,
+		f.countingSemaphore,
 	)
+	if f.testingKnobs.onSetupFlow != nil {
+		f.testingKnobs.onSetupFlow(creator)
+	}
 	_, err = creator.setupFlow(ctx, f.GetFlowCtx(), spec.Processors, opt)
 	if err == nil {
 		f.operatorConcurrency = creator.operatorConcurrency
@@ -113,17 +197,6 @@ func (f *vectorizedFlow) Setup(
 		f.bufferingMemAccounts = append(f.bufferingMemAccounts, creator.bufferingMemAccounts...)
 		log.VEventf(ctx, 1, "vectorized flow setup succeeded")
 		return ctx, nil
-	}
-	if err := f.Cfg.TempFS.DeleteDir(flowTempStoragePath); err != nil {
-		// Log error as a Warning but keep on going to close the memory
-		// infrastructure.
-		log.Warningf(
-			ctx,
-			"unable to remove flow %s's temporary directory at %s, files may be left over: %v",
-			f.GetID().Short(),
-			flowTempStoragePath,
-			err,
-		)
 	}
 	// It is (theoretically) possible that some of the memory monitoring
 	// infrastructure was created even in case of an error, and we need to clean
@@ -157,6 +230,41 @@ func (f *vectorizedFlow) Release() {
 	vectorizedFlowPool.Put(f)
 }
 
+// tryRemoveAll tries to remove all directories and files contained in root as
+// well as root.
+// Used as a temporary solution to forcefully remove the flow's temporary
+// storage directory until #45098 is resolved.
+// TODO(asubiotto): Remove once #45098 is resolved.
+func (f *vectorizedFlow) tryRemoveAll(root string) error {
+	// Unfortunately there is no way to Stat using TempFS, so simply try all
+	// alternatives.
+	if f.Cfg.TempFS.DeleteFile(root) != nil {
+		// If there was an error, it might be a directory.
+		if f.Cfg.TempFS.DeleteDir(root) != nil {
+			// DeleteDir failed, this is probably due to children.
+			children, err := f.Cfg.TempFS.ListDir(root)
+			if err != nil {
+				// This would be a weird error, so return it.
+				return err
+			}
+			for _, child := range children {
+				if child == "." || child == ".." {
+					continue
+				}
+				// ListDir returns relative paths, so join with parent dir.
+				if err := f.tryRemoveAll(filepath.Join(root, child)); err != nil {
+					return err
+				}
+			}
+			// Now that children are cleaned up, delete the directory.
+			if err := f.Cfg.TempFS.DeleteDir(root); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // Cleanup is part of the flowinfra.Flow interface.
 func (f *vectorizedFlow) Cleanup(ctx context.Context) {
 	// This cleans up all the memory monitoring of the vectorized flow.
@@ -169,17 +277,22 @@ func (f *vectorizedFlow) Cleanup(ctx context.Context) {
 	for _, memMonitor := range f.bufferingMemMonitors {
 		memMonitor.Stop(ctx)
 	}
-	flowTempStoragePath := filepath.Join(f.Cfg.TempStoragePath, f.GetID().String())
-	if err := f.Cfg.TempFS.DeleteDir(flowTempStoragePath); err != nil {
-		// Log error as a Warning but keep on going to close the memory
-		// infrastructure.
-		log.Warningf(
-			ctx,
-			"unable to remove flow %s's temporary directory at %s, files may be left over: %v",
-			f.GetID().Short(),
-			flowTempStoragePath,
-			err,
-		)
+	if atomic.LoadInt32(&f.tempStorage.created) == 1 {
+		if err := f.tryRemoveAll(f.tempStorage.path); err != nil {
+			// Log error as a Warning but keep on going to close the memory
+			// infrastructure.
+			log.Warningf(
+				ctx,
+				"unable to remove flow %s's temporary directory at %s, files may be left over: %v",
+				f.GetID().Short(),
+				f.tempStorage.path,
+				err,
+			)
+		}
+	}
+	// Release any leftover temporary storage file descriptors from this flow.
+	if unreleased := atomic.LoadInt64(&f.countingSemaphore.count); unreleased > 0 {
+		f.countingSemaphore.Release(int(unreleased))
 	}
 	f.FlowBase.Cleanup(ctx)
 	f.Release()
@@ -336,6 +449,7 @@ type vectorizedFlowCreator struct {
 	bufferingMemAccounts []*mon.BoundAccount
 
 	diskQueueCfg colcontainer.DiskQueueCfg
+	fdSemaphore  semaphore.Semaphore
 }
 
 func newVectorizedFlowCreator(
@@ -347,6 +461,7 @@ func newVectorizedFlowCreator(
 	nodeDialer *nodedialer.Dialer,
 	flowID execinfrapb.FlowID,
 	diskQueueCfg colcontainer.DiskQueueCfg,
+	fdSemaphore semaphore.Semaphore,
 ) *vectorizedFlowCreator {
 	return &vectorizedFlowCreator{
 		flowCreatorHelper:              helper,
@@ -360,6 +475,7 @@ func newVectorizedFlowCreator(
 		nodeDialer:                     nodeDialer,
 		flowID:                         flowID,
 		diskQueueCfg:                   diskQueueCfg,
+		fdSemaphore:                    fdSemaphore,
 	}
 }
 
@@ -448,15 +564,27 @@ func (s *vectorizedFlowCreator) setupRouter(
 		return errors.Errorf("vectorized output router type %s unsupported", output.Type)
 	}
 
-	hashRouterMemMonitor := s.createBufferingUnlimitedMemMonitor(ctx, flowCtx, "hash-router")
+	// HashRouter memory monitor names are the concatenated output stream IDs.
+	streamIDs := make([]string, len(output.Streams))
+	for i, s := range output.Streams {
+		streamIDs[i] = strconv.Itoa(int(s.StreamID))
+	}
+	mmName := "hash-router-[" + strings.Join(streamIDs, ",") + "]"
+
+	hashRouterMemMonitor := s.createBufferingUnlimitedMemMonitor(ctx, flowCtx, mmName)
 	allocators := make([]*colexec.Allocator, len(output.Streams))
 	for i := range allocators {
 		acc := hashRouterMemMonitor.MakeBoundAccount()
 		allocators[i] = colexec.NewAllocator(ctx, &acc)
 		s.bufferingMemAccounts = append(s.bufferingMemAccounts, &acc)
 	}
-	router, outputs := colexec.NewHashRouter(allocators, input, outputTyps, output.HashColumns, execinfra.GetWorkMemLimit(flowCtx.Cfg), s.diskQueueCfg)
+	limit := execinfra.GetWorkMemLimit(flowCtx.Cfg)
+	if flowCtx.Cfg.TestingKnobs.ForceDiskSpill {
+		limit = 1
+	}
+	router, outputs := colexec.NewHashRouter(allocators, input, outputTyps, output.HashColumns, limit, s.diskQueueCfg, s.fdSemaphore)
 	runRouter := func(ctx context.Context, _ context.CancelFunc) {
+		logtags.AddTag(ctx, "hashRouterID", mmName)
 		router.Run(ctx)
 	}
 	s.accumulateAsyncComponent(runRouter)
@@ -673,17 +801,8 @@ func (s *vectorizedFlowCreator) setupOutput(
 		}
 		// Make the materializer, which will write to the given receiver.
 		columnTypes := s.syncFlowConsumer.Types()
-		converted, err := typeconv.FromColumnTypes(columnTypes)
-		if err != nil {
-			return errors.AssertionFailedf(
-				"unsupported types should have been caught in SupportsVectorized check\n%v", err)
-		}
-		for i, expColType := range converted {
-			if opOutputTypes[i] != expColType {
-				return errors.Errorf("mismatched physical types at index %d: expected %v\tactual %v ",
-					i, converted, opOutputTypes,
-				)
-			}
+		if err := assertTypesMatch(columnTypes, opOutputTypes); err != nil {
+			return err
 		}
 		var outputStatsToTrace func()
 		if s.recordingStats {
@@ -779,6 +898,8 @@ func (s *vectorizedFlowCreator) setupFlow(
 			Inputs:               inputs,
 			StreamingMemAccount:  s.newStreamingMemAccount(flowCtx),
 			ProcessorConstructor: rowexec.NewProcessor,
+			DiskQueueCfg:         s.diskQueueCfg,
+			FDSemaphore:          s.fdSemaphore,
 		}
 		result, err := colexec.NewColOperator(ctx, flowCtx, args)
 		// Even when err is non-nil, it is possible that the buffering memory
@@ -792,9 +913,13 @@ func (s *vectorizedFlowCreator) setupFlow(
 		if flowCtx.Cfg != nil && flowCtx.Cfg.TestingKnobs.EnableVectorizedInvariantsChecker {
 			result.Op = colexec.NewInvariantsChecker(result.Op, len(result.ColumnTypes))
 		}
-		if flowCtx.EvalCtx.SessionData.VectorizeMode == sessiondata.VectorizeAuto &&
+		if flowCtx.EvalCtx.SessionData.VectorizeMode == sessiondata.Vectorize192Auto &&
 			!result.IsStreaming {
-			return nil, errors.Errorf("non-streaming operator encountered when vectorize=auto")
+			return nil, errors.Errorf("non-streaming operator encountered when vectorize=192auto")
+		}
+		if flowCtx.EvalCtx.SessionData.VectorizeMode == sessiondata.VectorizeAuto &&
+			(!result.IsStreaming && !result.CanRunInAutoMode) {
+			return nil, errors.Errorf("non-streaming operator encountered that is not marked as green for vectorize=auto")
 		}
 		// We created a streaming memory account when calling NewColOperator above,
 		// so there is definitely at least one memory account, and it doesn't
@@ -815,11 +940,14 @@ func (s *vectorizedFlowCreator) setupFlow(
 			op = vsc
 		}
 
-		if flowCtx.EvalCtx.SessionData.VectorizeMode == sessiondata.VectorizeAuto &&
+		if (flowCtx.EvalCtx.SessionData.VectorizeMode == sessiondata.Vectorize192Auto ||
+			flowCtx.EvalCtx.SessionData.VectorizeMode == sessiondata.VectorizeAuto) &&
 			pspec.Output[0].Type == execinfrapb.OutputRouterSpec_BY_HASH {
-			// exec.HashRouter can do unlimited buffering, and it is present in the
-			// flow, so we don't want to run such a flow via the vectorized engine
-			// when vectorize=auto.
+			// colexec.HashRouter is not supported when vectorize=192auto since it can
+			// buffer an unlimited number of tuples, even though it falls back to
+			// disk. vectorize=auto does support this.
+			// TODO(asubiotto): Currently unsupported with vectorize=auto as well,
+			//  will be enabled in a future PR.
 			return nil, errors.Errorf("hash router encountered when vectorize=auto")
 		}
 		opOutputTypes, err := typeconv.FromColumnTypes(result.ColumnTypes)
@@ -837,26 +965,31 @@ func (s *vectorizedFlowCreator) setupFlow(
 	NEXTOUTPUT:
 		for i := range pspec.Output {
 			for j := range pspec.Output[i].Streams {
-				stream := &pspec.Output[i].Streams[j]
-				if stream.Type != execinfrapb.StreamEndpointSpec_LOCAL {
+				outputStream := &pspec.Output[i].Streams[j]
+				if outputStream.Type != execinfrapb.StreamEndpointSpec_LOCAL {
 					continue
 				}
-				procIdx, ok := streamIDToSpecIdx[stream.StreamID]
+				procIdx, ok := streamIDToSpecIdx[outputStream.StreamID]
 				if !ok {
-					return nil, errors.Errorf("couldn't find stream %d", stream.StreamID)
+					return nil, errors.Errorf("couldn't find stream %d", outputStream.StreamID)
 				}
 				outputSpec := &processorSpecs[procIdx]
 				for k := range outputSpec.Input {
 					for l := range outputSpec.Input[k].Streams {
-						stream := outputSpec.Input[k].Streams[l]
-						if stream.Type == execinfrapb.StreamEndpointSpec_REMOTE {
+						inputStream := outputSpec.Input[k].Streams[l]
+						if inputStream.StreamID == outputStream.StreamID {
+							if err := assertTypesMatch(outputSpec.Input[k].ColumnTypes, opOutputTypes); err != nil {
+								return nil, err
+							}
+						}
+						if inputStream.Type == execinfrapb.StreamEndpointSpec_REMOTE {
 							// Remote streams are not present in streamIDToInputOp. The
 							// Inboxes that consume these streams are created at the same time
 							// as the operator that needs them, so skip the creation check for
 							// this input.
 							continue
 						}
-						if _, ok := s.streamIDToInputOp[stream.StreamID]; !ok {
+						if _, ok := s.streamIDToInputOp[inputStream.StreamID]; !ok {
 							continue NEXTOUTPUT
 						}
 					}
@@ -872,6 +1005,23 @@ func (s *vectorizedFlowCreator) setupFlow(
 		execerror.VectorizedInternalPanic("not all vectorized stats collectors have been processed")
 	}
 	return s.leaves, nil
+}
+
+// assertTypesMatch checks whether expected logical types match with actual
+// physical types and returns an error if not.
+func assertTypesMatch(expected []types.T, actual []coltypes.T) error {
+	converted, err := typeconv.FromColumnTypes(expected)
+	if err != nil {
+		return err
+	}
+	for i := range converted {
+		if converted[i] != actual[i] {
+			return errors.Errorf("mismatched physical types at index %d: expected %v\tactual %v ",
+				i, converted, actual,
+			)
+		}
+	}
+	return nil
 }
 
 type vectorizedInboundStreamHandler struct {
@@ -993,10 +1143,7 @@ func SupportsVectorized(
 	if output == nil {
 		output = &execinfra.RowChannel{}
 	}
-	creator := newVectorizedFlowCreator(
-		newNoopFlowCreatorHelper(), vectorizedRemoteComponentCreator{}, false,
-		nil, output, nil, execinfrapb.FlowID{}, colcontainer.DiskQueueCfg{},
-	)
+	creator := newVectorizedFlowCreator(newNoopFlowCreatorHelper(), vectorizedRemoteComponentCreator{}, false, nil, output, nil, execinfrapb.FlowID{}, colcontainer.DiskQueueCfg{}, flowCtx.Cfg.VecFDSemaphore)
 	// We create an unlimited memory account because we're interested whether the
 	// flow is supported via the vectorized engine in general (without paying
 	// attention to the memory since it is node-dependent in the distributed

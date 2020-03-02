@@ -93,6 +93,7 @@ transaction_stmt ::=
 alter_stmt ::=
 	alter_ddl_stmt
 	| alter_user_stmt
+	| alter_role_stmt
 
 backup_stmt ::=
 	'BACKUP' 'TO' partitioned_backup opt_as_of_clause opt_incremental opt_with_options
@@ -299,6 +300,10 @@ alter_ddl_stmt ::=
 alter_user_stmt ::=
 	alter_user_password_stmt
 
+alter_role_stmt ::=
+	'ALTER' role_or_group string_or_placeholder role_privileges
+	| 'ALTER' role_or_group string_or_placeholder 'WITH' role_privileges
+
 partitioned_backup ::=
 	string_or_placeholder
 	| '(' string_or_placeholder_list ')'
@@ -334,6 +339,10 @@ create_user_stmt ::=
 create_role_stmt ::=
 	'CREATE' role_or_group string_or_placeholder
 	| 'CREATE' role_or_group 'IF' 'NOT' 'EXISTS' string_or_placeholder
+	| 'CREATE' role_or_group string_or_placeholder role_privileges
+	| 'CREATE' role_or_group string_or_placeholder 'WITH' role_privileges
+	| 'CREATE' role_or_group 'IF' 'NOT' 'EXISTS' string_or_placeholder role_privileges
+	| 'CREATE' role_or_group 'IF' 'NOT' 'EXISTS' string_or_placeholder 'WITH' role_privileges
 
 create_ddl_stmt ::=
 	create_changefeed_stmt
@@ -648,6 +657,7 @@ unreserved_keyword ::=
 	| 'CONVERSION'
 	| 'COPY'
 	| 'COVERING'
+	| 'CREATEROLE'
 	| 'CUBE'
 	| 'CURRENT'
 	| 'CYCLE'
@@ -741,6 +751,7 @@ unreserved_keyword ::=
 	| 'NO'
 	| 'NORMAL'
 	| 'NO_INDEX_JOIN'
+	| 'NOCREATEROLE'
 	| 'NOWAIT'
 	| 'NULLS'
 	| 'IGNORE_FOREIGN_KEYS'
@@ -1002,15 +1013,18 @@ alter_user_password_stmt ::=
 	'ALTER' 'USER' string_or_placeholder password_clause
 	| 'ALTER' 'USER' 'IF' 'EXISTS' string_or_placeholder password_clause
 
+role_or_group ::=
+	'ROLE'
+
+role_privileges ::=
+	role_privilege_list
+
 as_of_clause ::=
 	'AS' 'OF' 'SYSTEM' 'TIME' a_expr
 
 opt_password ::=
 	password_clause
 	| 
-
-role_or_group ::=
-	'ROLE'
 
 create_changefeed_stmt ::=
 	'CREATE' 'CHANGEFEED' 'FOR' changefeed_targets opt_changefeed_sink opt_with_options
@@ -1071,7 +1085,8 @@ sort_clause ::=
 limit_clause ::=
 	'LIMIT' 'ALL'
 	| 'LIMIT' a_expr
-	| 'FETCH' first_or_next opt_select_fetch_first_value row_or_rows 'ONLY'
+	| 'FETCH' first_or_next select_fetch_first_value row_or_rows 'ONLY'
+	| 'FETCH' first_or_next row_or_rows 'ONLY'
 
 target_list ::=
 	( target_elem ) ( ( ',' target_elem ) )*
@@ -1363,6 +1378,10 @@ password_clause ::=
 	opt_with 'PASSWORD' string_or_placeholder
 	| opt_with 'PASSWORD' 'NULL'
 
+role_privilege_list ::=
+	role_privilege
+	| role_privilege role_privilege_list
+
 changefeed_targets ::=
 	single_table_pattern_list
 	| 'TABLE' single_table_pattern_list
@@ -1466,10 +1485,10 @@ first_or_next ::=
 	'FIRST'
 	| 'NEXT'
 
-opt_select_fetch_first_value ::=
-	signed_iconst
-	| '(' a_expr ')'
-	| 
+select_fetch_first_value ::=
+	c_expr
+	| only_signed_iconst
+	| only_signed_fconst
 
 row_or_rows ::=
 	'ROW'
@@ -1601,7 +1620,7 @@ for_locking_items ::=
 
 offset_clause ::=
 	'OFFSET' a_expr
-	| 'OFFSET' c_expr row_or_rows
+	| 'OFFSET' select_fetch_first_value row_or_rows
 
 generic_set ::=
 	var_name to_or_eq var_list
@@ -1761,6 +1780,10 @@ alter_index_cmds ::=
 sequence_option_list ::=
 	( sequence_option_elem ) ( ( sequence_option_elem ) )*
 
+role_privilege ::=
+	'CREATEROLE'
+	| 'NOCREATEROLE'
+
 single_table_pattern_list ::=
 	( table_name ) ( ( ',' table_name ) )*
 
@@ -1801,10 +1824,13 @@ sortby ::=
 	| 'PRIMARY' 'KEY' table_name opt_asc_desc
 	| 'INDEX' table_name '@' index_name opt_asc_desc
 
-signed_iconst ::=
-	'ICONST'
-	| '+' 'ICONST'
+only_signed_iconst ::=
+	'+' 'ICONST'
 	| '-' 'ICONST'
+
+only_signed_fconst ::=
+	'+' 'FCONST'
+	| '-' 'FCONST'
 
 target_name ::=
 	unrestricted_name
@@ -1821,7 +1847,7 @@ constraint_name ::=
 constraint_elem ::=
 	'CHECK' '(' a_expr ')'
 	| 'UNIQUE' '(' index_params ')' opt_storing opt_interleave opt_partition_by
-	| 'PRIMARY' 'KEY' '(' index_params ')' opt_hash_sharded
+	| 'PRIMARY' 'KEY' '(' index_params ')' opt_hash_sharded opt_interleave
 	| 'FOREIGN' 'KEY' '(' name_list ')' 'REFERENCES' table_name opt_column_list key_match reference_actions
 
 const_typename ::=
@@ -2390,6 +2416,10 @@ join_outer ::=
 
 rowsfrom_item ::=
 	func_expr_windowless
+
+signed_iconst ::=
+	'ICONST'
+	| only_signed_iconst
 
 create_as_col_qualification_elem ::=
 	'PRIMARY' 'KEY'

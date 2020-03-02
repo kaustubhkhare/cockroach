@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprotectedts"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -49,6 +50,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -67,6 +69,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/storage/protectedts/ptprovider"
+	"github.com/cockroachdb/cockroach/pkg/storage/protectedts/ptreconcile"
 	"github.com/cockroachdb/cockroach/pkg/storage/reports"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/ts"
@@ -89,6 +92,7 @@ import (
 	"github.com/cockroachdb/logtags"
 	raven "github.com/getsentry/raven-go"
 	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
+	"github.com/marusama/semaphore"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
@@ -203,8 +207,9 @@ type Server struct {
 	internalMemMetrics  sql.MemoryMetrics
 	adminMemMetrics     sql.MemoryMetrics
 	// sqlMemMetrics are used to track memory usage of sql sessions.
-	sqlMemMetrics       sql.MemoryMetrics
-	protectedtsProvider protectedts.Provider
+	sqlMemMetrics         sql.MemoryMetrics
+	protectedtsProvider   protectedts.Provider
+	protectedtsReconciler *ptreconcile.Reconciler
 }
 
 // NewServer creates a Server from a server.Config.
@@ -459,7 +464,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	// This function defines how ExternalStorage objects are created.
 	externalStorage := func(ctx context.Context, dest roachpb.ExternalStorage) (cloud.ExternalStorage, error) {
 		return cloud.MakeExternalStorage(
-			ctx, dest, st,
+			ctx, dest, s.cfg.ExternalIOConfig, st,
 			blobs.NewBlobClientFactory(
 				s.nodeIDContainer.Get(),
 				s.nodeDialer,
@@ -469,7 +474,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	}
 	externalStorageFromURI := func(ctx context.Context, uri string) (cloud.ExternalStorage, error) {
 		return cloud.ExternalStorageFromURI(
-			ctx, uri, st,
+			ctx, uri, s.cfg.ExternalIOConfig, st,
 			blobs.NewBlobClientFactory(
 				s.nodeIDContainer.Get(),
 				s.nodeDialer,
@@ -478,11 +483,13 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		)
 	}
 
-	s.protectedtsProvider = ptprovider.New(ptprovider.Config{
+	if s.protectedtsProvider, err = ptprovider.New(ptprovider.Config{
 		DB:               s.db,
 		InternalExecutor: internalExecutor,
 		Settings:         st,
-	})
+	}); err != nil {
+		return nil, err
+	}
 
 	// Similarly for execCfg.
 	var execCfg sql.ExecutorConfig
@@ -522,7 +529,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 			// before this is ever called.
 			Refresh: func(rangeIDs ...roachpb.RangeID) {
 				for _, rangeID := range rangeIDs {
-					repl, err := s.node.stores.GetReplicaForRangeID(rangeID)
+					repl, _, err := s.node.stores.GetReplicaForRangeID(rangeID)
 					if err != nil || repl == nil {
 						continue
 					}
@@ -582,6 +589,17 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		jobAdoptionStopFile,
 	)
 	s.registry.AddMetricStruct(s.jobRegistry.MetricsStruct())
+	s.protectedtsReconciler = ptreconcile.NewReconciler(ptreconcile.Config{
+		Settings: s.st,
+		Stores:   s.node.stores,
+		DB:       s.db,
+		Storage:  s.protectedtsProvider,
+		Cache:    s.protectedtsProvider,
+		StatusFuncs: ptreconcile.StatusFuncs{
+			jobsprotectedts.MetaType: jobsprotectedts.MakeStatusFunc(s.jobRegistry),
+		},
+	})
+	s.registry.AddMetricStruct(s.protectedtsReconciler.Metrics())
 
 	distSQLMetrics := execinfra.MakeDistSQLMetrics(cfg.HistogramWindowInterval())
 	s.registry.AddMetricStruct(distSQLMetrics)
@@ -620,7 +638,12 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		TempStorage:     tempEngine,
 		TempStoragePath: s.cfg.TempStorageConfig.Path,
 		TempFS:          tempFS,
-		DiskMonitor:     s.cfg.TempStorageConfig.Mon,
+		// COCKROACH_VEC_MAX_OPEN_FDS specifies the maximum number of open file
+		// descriptors that the vectorized execution engine may have open at any
+		// one time. This limit is implemented as a weighted semaphore acquired
+		// before opening files.
+		VecFDSemaphore: semaphore.New(envutil.EnvOrDefaultInt("COCKROACH_VEC_MAX_OPEN_FDS", colexec.VecMaxOpenFDsLimit)),
+		DiskMonitor:    s.cfg.TempStorageConfig.Mon,
 
 		ParentMemoryMonitor: &rootSQLMemoryMonitor,
 		BulkAdder: func(
@@ -758,6 +781,11 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 			true /*enableGc*/, true /*forceSyncWrites*/, true, /* enableMsgCount */
 		),
 
+		SlowQueryLogger: log.NewSecondaryLogger(
+			loggerCtx, nil, "sql-slow",
+			true /*enableGc*/, false /*forceSyncWrites*/, true, /* enableMsgCount */
+		),
+
 		QueryCache:                 querycache.New(s.cfg.SQLQueryCacheSize),
 		ProtectedTimestampProvider: s.protectedtsProvider,
 	}
@@ -825,7 +853,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	)
 	s.internalExecutor = internalExecutor
 	execCfg.InternalExecutor = internalExecutor
-
+	s.status.stmtDiagnosticsRequester = execCfg.NewStmtDiagnosticsRequestRegistry()
 	s.execCfg = &execCfg
 
 	s.leaseMgr.SetInternalExecutor(execCfg.InternalExecutor)
@@ -1612,7 +1640,11 @@ func (s *Server) Start(ctx context.Context) error {
 		return err
 	}
 
+	// Start the protected timestamp subsystem.
 	if err := s.protectedtsProvider.Start(ctx, s.stopper); err != nil {
+		return err
+	}
+	if err := s.protectedtsReconciler.Start(ctx, s.stopper); err != nil {
 		return err
 	}
 

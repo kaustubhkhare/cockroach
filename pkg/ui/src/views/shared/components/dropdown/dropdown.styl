@@ -38,9 +38,11 @@ $dropdown-hover-color = darken($background-color, 2.5%)
     background-color $dropdown-hover-color
   
   .Select-arrow-zone
-    color $grey
+    color $adminui-blue-1-base
+    .anticon
+      transform rotate(180deg)
     .active
-      color $adminui-blue-1-base
+      color $grey
   
   &._range
     width 423px
@@ -121,5 +123,8 @@ $dropdown-hover-color = darken($background-color, 2.5%)
 
       &:hover
         background-color $dropdown-hover-color
+.dropdown.full-size
+  .Select-menu-outer, .Select-menu
+    max-height 450px
 
 // NOTE: react-select styles can be found in styl/shame.styl

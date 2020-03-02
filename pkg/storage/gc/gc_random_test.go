@@ -88,6 +88,8 @@ func TestRunNewVsOld(t *testing.T) {
 	} {
 		t.Run(fmt.Sprintf("%v@%v,ttl=%v", tc.ds, tc.now, tc.ttl), func(t *testing.T) {
 			eng := engine.NewDefaultInMem()
+			defer eng.Close()
+
 			tc.ds.dist(N, rng).setupTest(t, eng, *tc.ds.desc())
 			snap := eng.NewSnapshot()
 
@@ -136,7 +138,7 @@ func BenchmarkRun(b *testing.B) {
 			func(ctx context.Context, intents []roachpb.Intent) error {
 				return nil
 			},
-			func(ctx context.Context, txn *roachpb.Transaction, intents []roachpb.Intent) error {
+			func(ctx context.Context, txn *roachpb.Transaction, intents []roachpb.LockUpdate) error {
 				return nil
 			})
 	}
@@ -206,7 +208,7 @@ func (f *fakeGCer) GC(ctx context.Context, keys []roachpb.GCRequest_GCKey) error
 }
 
 func (f *fakeGCer) resolveIntentsAsync(
-	_ context.Context, txn *roachpb.Transaction, intents []roachpb.Intent,
+	_ context.Context, txn *roachpb.Transaction, intents []roachpb.LockUpdate,
 ) error {
 	f.txnIntents = append(f.txnIntents, txnIntents{txn: txn, intents: intents})
 	return nil
@@ -244,5 +246,5 @@ func intentLess(a, b *roachpb.Intent) bool {
 
 type txnIntents struct {
 	txn     *roachpb.Transaction
-	intents []roachpb.Intent
+	intents []roachpb.LockUpdate
 }

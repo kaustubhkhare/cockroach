@@ -107,7 +107,8 @@ type tupleHashDistributor struct {
 	selections [][]uint16
 	// cancelChecker is used during the hashing of the rows to distribute to
 	// check for query cancellation.
-	cancelChecker CancelChecker
+	cancelChecker  CancelChecker
+	decimalScratch decimalOverloadScratch
 }
 
 func newTupleHashDistributor(initHashValue uint64, numOutputs int) *tupleHashDistributor {
@@ -129,7 +130,7 @@ func (d *tupleHashDistributor) distribute(
 	initHash(d.buckets, n, d.initHashValue)
 
 	for _, i := range hashCols {
-		rehash(ctx, d.buckets, types[i], b.ColVec(int(i)), n, b.Selection(), d.cancelChecker)
+		rehash(ctx, d.buckets, types[i], b.ColVec(int(i)), n, b.Selection(), d.cancelChecker, d.decimalScratch)
 	}
 
 	finalizeHash(d.buckets, n, uint64(len(d.selections)))
@@ -153,4 +154,17 @@ func (d *tupleHashDistributor) distribute(
 		}
 	}
 	return d.selections
+}
+
+// resetNumOutputs sets up the tupleHashDistributor to distribute the tuples
+// to a different number of outputs.
+func (d *tupleHashDistributor) resetNumOutputs(numOutputs int) {
+	if cap(d.selections) >= numOutputs {
+		d.selections = d.selections[:numOutputs]
+		return
+	}
+	d.selections = d.selections[:cap(d.selections)]
+	for len(d.selections) < numOutputs {
+		d.selections = append(d.selections, make([]uint16, 0, coldata.BatchSize()))
+	}
 }

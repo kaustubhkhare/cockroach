@@ -55,14 +55,14 @@ ORDER BY
 ----
 sort
  ├── save-table-name: q22_sort_1
- ├── columns: cntrycode:27(string) numcust:28(int) totacctbal:29(float)
+ ├── columns: cntrycode:27(string) numcust:28(int!null) totacctbal:29(float!null)
  ├── stats: [rows=1e-10, distinct(27)=1e-10, null(27)=0, distinct(28)=1e-10, null(28)=0, distinct(29)=1e-10, null(29)=0]
  ├── key: (27)
  ├── fd: (27)-->(28,29)
  ├── ordering: +27
  └── group-by
       ├── save-table-name: q22_group_by_2
-      ├── columns: cntrycode:27(string) count_rows:28(int) sum:29(float)
+      ├── columns: cntrycode:27(string) count_rows:28(int!null) sum:29(float!null)
       ├── grouping columns: cntrycode:27(string)
       ├── stats: [rows=1e-10, distinct(27)=1e-10, null(27)=0, distinct(28)=1e-10, null(28)=0, distinct(29)=1e-10, null(29)=0]
       ├── key: (27)
@@ -93,9 +93,9 @@ sort
       │    │    │    │    ├── key: (1)
       │    │    │    │    └── fd: (1)-->(5,6)
       │    │    │    └── filters
-      │    │    │         ├── substring(c_phone, 1, 2) IN ('13', '17', '18', '23', '29', '30', '31') [type=bool, outer=(5)]
+      │    │    │         ├── substring(c_phone:5, 1, 2) IN ('13', '17', '18', '23', '29', '30', '31') [type=bool, outer=(5)]
       │    │    │         └── gt [type=bool, outer=(6), subquery, constraints=(/6: (/NULL - ])]
-      │    │    │              ├── variable: c_acctbal [type=float]
+      │    │    │              ├── c_acctbal:6 [type=float]
       │    │    │              └── subquery [type=float]
       │    │    │                   └── scalar-group-by
       │    │    │                        ├── save-table-name: q22_scalar_group_by_7
@@ -113,18 +113,18 @@ sort
       │    │    │                        │    │    ├── columns: c_phone:13(char!null) c_acctbal:14(float!null)
       │    │    │                        │    │    └── stats: [rows=150000, distinct(13)=150000, null(13)=0, distinct(14)=140628, null(14)=0]
       │    │    │                        │    └── filters
-      │    │    │                        │         ├── c_acctbal > 0.0 [type=bool, outer=(14), constraints=(/14: [/5e-324 - ]; tight)]
-      │    │    │                        │         └── substring(c_phone, 1, 2) IN ('13', '17', '18', '23', '29', '30', '31') [type=bool, outer=(13)]
+      │    │    │                        │         ├── c_acctbal:14 > 0.0 [type=bool, outer=(14), constraints=(/14: [/5e-324 - ]; tight)]
+      │    │    │                        │         └── substring(c_phone:13, 1, 2) IN ('13', '17', '18', '23', '29', '30', '31') [type=bool, outer=(13)]
       │    │    │                        └── aggregations
-      │    │    │                             └── avg [type=float, outer=(14)]
-      │    │    │                                  └── variable: c_acctbal [type=float]
+      │    │    │                             └── avg [as=avg:17, type=float, outer=(14)]
+      │    │    │                                  └── c_acctbal:14 [type=float]
       │    │    └── filters (true)
       │    └── projections
-      │         └── substring(c_phone, 1, 2) [type=string, outer=(5)]
+      │         └── substring(c_phone:5, 1, 2) [as=cntrycode:27, type=string, outer=(5)]
       └── aggregations
-           ├── count-rows [type=int]
-           └── sum [type=float, outer=(6)]
-                └── variable: c_acctbal [type=float]
+           ├── count-rows [as=count_rows:28, type=int]
+           └── sum [as=sum:29, type=float, outer=(6)]
+                └── c_acctbal:6 [type=float]
 
 stats table=q22_sort_1
 ----
